@@ -8,15 +8,15 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -29,7 +29,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-# Перезаписываем переменные окружения из файла .env, если он есть
+# Перезаписываем переменные окружения из файла .env
 load_dotenv(override=True)
 
 logging.basicConfig(
@@ -56,6 +56,9 @@ VELVET_VPN_TEXT = "💎 Velvet VPN › Доступно всё"
 
 # Лимиты для монетизации
 FREE_DAILY_LIKES = 25
+
+# Имя бота (обновляется автоматически при запуске)
+BOT_USERNAME = "lovchik_tg_bot"
 
 # Хранилище последнего сообщения бота для каждого пользователя (для автоудаления)
 last_bot_messages: Dict[int, int] = {}
@@ -146,6 +149,8 @@ def init_db() -> None:
             boost_until INTEGER NOT NULL DEFAULT 0,
             vip_until INTEGER NOT NULL DEFAULT 0,
             superlikes INTEGER NOT NULL DEFAULT 1,
+            referred_by INTEGER NOT NULL DEFAULT 0,
+            ref_count INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         )
         """
@@ -157,6 +162,21 @@ def init_db() -> None:
         cur.execute("ALTER TABLE profiles ADD COLUMN vip_until INTEGER NOT NULL DEFAULT 0")
     if "superlikes" not in p_cols:
         cur.execute("ALTER TABLE profiles ADD COLUMN superlikes INTEGER NOT NULL DEFAULT 1")
+    if "referred_by" not in p_cols:
+        cur.execute("ALTER TABLE profiles ADD COLUMN referred_by INTEGER NOT NULL DEFAULT 0")
+    if "ref_count" not in p_cols:
+        cur.execute("ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0")
+
+    # Таблица ожидания рефералов (до момента создания анкеты)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pending_referrals (
+            user_id INTEGER PRIMARY KEY,
+            inviter_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
 
     cur.execute(
         """
@@ -269,7 +289,7 @@ def is_vip(row: sqlite3.Row) -> bool:
 
 
 # =========================
-# DB QUERIES
+# DB QUERIES & REFERRAL LOGIC
 # =========================
 def get_profile(user_id: int) -> Optional[sqlite3.Row]:
     conn = db()
@@ -280,6 +300,30 @@ def get_profile(user_id: int) -> Optional[sqlite3.Row]:
     return row
 
 
+def save_pending_referral(user_id: int, inviter_id: int) -> bool:
+    """Сохраняет пригласившего для нового пользователя, пока он ещё не создал анкету."""
+    if user_id == inviter_id or inviter_id <= 0:
+        return False
+    if get_profile(user_id) is not None:
+        return False
+    inviter = get_profile(inviter_id)
+    if not inviter:
+        return False
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO pending_referrals (user_id, inviter_id, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (user_id, inviter_id, now_ts()),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
 def upsert_profile(
     user_id: int,
     username: Optional[str],
@@ -288,7 +332,11 @@ def upsert_profile(
     city: str,
     bio: str,
     photo_id: Optional[str],
-) -> None:
+) -> Tuple[bool, Optional[int], int]:
+    """
+    Создает или обновляет анкету.
+    Возвращает (is_new_profile, inviter_id, inviter_new_ref_count).
+    """
     conn = db()
     cur = conn.cursor()
     existing = get_profile(user_id)
@@ -302,20 +350,75 @@ def upsert_profile(
             """,
             (username, name, age, city, bio, photo_id, user_id),
         )
-    else:
-        cur.execute(
-            """
-            INSERT INTO profiles (
-                user_id, username, name, age, city, bio, photo_id,
-                active, boost_until, vip_until, superlikes, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 1, ?)
-            """,
-            (user_id, username, name, age, city, bio, photo_id, now_ts()),
+        conn.commit()
+        conn.close()
+        return False, None, 0
+
+    # Проверяем, пришел ли пользователь по реферальной ссылке
+    cur.execute("SELECT inviter_id FROM pending_referrals WHERE user_id = ?", (user_id,))
+    pend = cur.fetchone()
+    inviter_id = int(pend["inviter_id"]) if pend else 0
+
+    # Если пришел по рефке — даем 2 Супер-письма на старте вместо 1!
+    initial_superlikes = 2 if inviter_id > 0 else 1
+
+    cur.execute(
+        """
+        INSERT INTO profiles (
+            user_id, username, name, age, city, bio, photo_id,
+            active, boost_until, vip_until, superlikes, referred_by, ref_count, created_at
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?)
+        """,
+        (user_id, username, name, age, city, bio, photo_id, initial_superlikes, inviter_id, now_ts()),
+    )
+
+    if pend:
+        cur.execute("DELETE FROM pending_referrals WHERE user_id = ?", (user_id,))
 
     conn.commit()
     conn.close()
+
+    # Начисляем награду пригласившему
+    if inviter_id > 0 and get_profile(inviter_id):
+        conn2 = db()
+        cur2 = conn2.cursor()
+        cur2.execute("UPDATE profiles SET ref_count = ref_count + 1 WHERE user_id = ?", (inviter_id,))
+        cur2.execute("SELECT ref_count FROM profiles WHERE user_id = ?", (inviter_id,))
+        r_row = cur2.fetchone()
+        new_ref_count = int(r_row["ref_count"]) if r_row else 1
+        conn2.commit()
+        conn2.close()
+
+        # Базовая награда за каждого друга: +1 Супер-письмо и +6 часов ТОП-буста
+        add_superlikes(inviter_id, 1)
+        add_boost_hours(inviter_id, 6)
+
+        # Каждые 3 приглашенных друга = +24 часа VIP-статуса!
+        if new_ref_count % 3 == 0:
+            add_vip_days(inviter_id, 1, bonus_superlikes=1)
+
+        return True, inviter_id, new_ref_count
+
+    return True, None, 0
+
+
+def get_top_referrers(limit: int = 10) -> List[sqlite3.Row]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT name, age, city, ref_count, vip_until
+        FROM profiles
+        WHERE ref_count > 0
+        ORDER BY ref_count DESC, created_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def update_username(user_id: int, username: Optional[str]) -> None:
@@ -447,7 +550,6 @@ def get_matches(user_id: int) -> List[sqlite3.Row]:
 
 
 def get_incoming_likes(user_id: int) -> List[sqlite3.Row]:
-    """Возвращает тех, кто лайкнул пользователя, но кому пользователь еще не ответил."""
     me = get_profile(user_id)
     if not me:
         return []
@@ -667,7 +769,7 @@ def generate_yoomoney_link(order_id: str, total_rub: int, description: str) -> s
     params = {
         "receiver": YOOMONEY_WALLET,
         "quickpay-form": "button",
-        "paymentType": "AC",  # Оплата банковской картой или кошельком ЮMoney
+        "paymentType": "AC",
         "sum": str(total_rub),
         "label": order_id,
         "targets": description,
@@ -676,7 +778,6 @@ def generate_yoomoney_link(order_id: str, total_rub: int, description: str) -> s
 
 
 async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str]:
-    """Проверяет поступление платежа по метке (label = order_id) через API ЮMoney."""
     if not YOOMONEY_TOKEN:
         return False, "Токен ЮMoney (YOOMONEY_TOKEN) ещё не настроен в файле .env"
 
@@ -704,10 +805,12 @@ async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[b
                         and str(op.get("label")) == str(order_id)
                     ):
                         op_amount = float(op.get("amount", 0))
-                        # Учитываем возможную комиссию шлюза ЮMoney при переводе с карты (до 3%)
                         if op_amount >= expected_total * 0.95:
                             return True, str(op.get("operation_id", "yoomoney_paid"))
-                return False, "Платеж еще не поступил или находится в обработке. Подождите 10–15 секунд и нажмите «Проверить оплату» снова."
+                return (
+                    False,
+                    "Платеж еще не поступил или находится в обработке. Подождите 10–15 секунд и нажмите «Проверить оплату» снова.",
+                )
     except Exception as e:
         logging.error(f"YooMoney check error: {e}")
         return False, "Временная ошибка соединения с сервером ЮMoney. Попробуйте через пару секунд."
@@ -732,7 +835,6 @@ async def send_screen(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     photo_id: Optional[str] = None,
 ) -> Message:
-    """Удаляет предыдущее сообщение бота и отправляет новое (эффект одного чистого окна)."""
     prev_msg_id = last_bot_messages.get(user_id)
     if prev_msg_id:
         await safe_delete_message(bot, user_id, prev_msg_id)
@@ -793,10 +895,11 @@ def format_profile_card(row: sqlite3.Row, title: Optional[str] = None, show_stat
         lines.append(f"\n📊 <b>Статус:</b> {active_str}")
         lines.append(f"🛡 <b>Категория:</b> {group_str}")
         lines.append(f"💌 <b>Супер-писем:</b> {int(row['superlikes'])} шт.")
+        lines.append(f"👥 <b>Приглашено друзей:</b> {int(row['ref_count'])} чел.")
 
         if is_vip(row):
-            mins_left = max(1, (int(row["vip_until"]) - now_ts()) // 3600)
-            lines.append(f"👑 <b>VIP активен:</b> ещё ~{mins_left} ч.")
+            hours_left = max(1, (int(row["vip_until"]) - now_ts()) // 3600)
+            lines.append(f"👑 <b>VIP активен:</b> ещё ~{hours_left} ч.")
         if is_boosted(row):
             mins_left = max(1, (int(row["boost_until"]) - now_ts()) // 60)
             lines.append(f"🚀 <b>ТОП-буст:</b> ещё {mins_left} мин.")
@@ -829,7 +932,7 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="💞 Взаимные симпатии", callback_data="menu:matches"),
-            InlineKeyboardButton(text="👤 Моя анкета", callback_data="menu:me"),
+            InlineKeyboardButton(text="🎁 Бесплатный VIP (Рефералка)", callback_data="menu:referral"),
         ],
     ]
 
@@ -841,9 +944,32 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
             ]
         )
 
-    rows.append([InlineKeyboardButton(text="⚙️ Настройки анкеты", callback_data="menu:settings")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="👤 Моя анкета", callback_data="menu:me"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
+        ]
+    )
     rows.append([vpn_button()])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def referral_kb(user_id: int) -> InlineKeyboardMarkup:
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    share_text = (
+        "💘 Зацени крутого бота для знакомств Лавчик! "
+        "Заходи по моей ссылке и получи +2 Супер-письма в подарок 🎁"
+    )
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Поделиться ссылкой с друзьями", url=share_url)],
+            [InlineKeyboardButton(text="🏆 ТОП-10 приглашающих", callback_data="ref:leaderboard")],
+            [vpn_button()],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
+        ]
+    )
 
 
 def reg_nav_kb(can_back: bool = True, skip_photo: bool = False) -> InlineKeyboardMarkup:
@@ -897,6 +1023,7 @@ def who_liked_kb(target_id: int, viewer_is_vip: bool) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="👑 Открыть анкету (Подключить VIP)", callback_data="shop:item:vip_7")],
+                [InlineKeyboardButton(text="🎁 Получить VIP за друзей", callback_data="menu:referral")],
                 [vpn_button()],
                 [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
             ]
@@ -932,6 +1059,7 @@ def shop_menu_kb() -> InlineKeyboardMarkup:
                 )
             ]
         )
+    rows.append([InlineKeyboardButton(text="🎁 Получить VIP бесплатно за друзей", callback_data="menu:referral")])
     rows.append([vpn_button()])
     rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -982,6 +1110,10 @@ class AdminBroadcastState(StatesGroup):
     waiting_post = State()
 
 
+class AdminGiftState(StatesGroup):
+    waiting_user_id = State()
+
+
 # =========================
 # SCREEN RENDERERS
 # =========================
@@ -989,7 +1121,7 @@ async def render_home(bot: Bot, user_id: int, notice: Optional[str] = None) -> N
     me = get_profile(user_id)
     if not me:
         text = (
-            "💘 <b>Добро пожаловать в бот знакомств!</b>\n\n"
+            "💘 <b>Добро пожаловать в бот знакомств «Лавчик»!</b>\n\n"
             "Здесь ты быстро найдешь новых друзей, общение или вторую половинку в своем городе.\n\n"
             "🔒 <i>Строгое разделение по возрасту, умный подбор анкет и полная приватность.</i>\n\n"
             "Нажми кнопку ниже, чтобы создать анкету за 1 минуту 👇"
@@ -1011,6 +1143,35 @@ async def render_home(bot: Bot, user_id: int, notice: Optional[str] = None) -> N
         reply_markup=main_menu_kb(user_id),
         photo_id=me["photo_id"],
     )
+
+
+async def render_referral_screen(bot: Bot, user_id: int) -> None:
+    me = get_profile(user_id)
+    if not me:
+        await render_home(bot, user_id)
+        return
+
+    ref_cnt = int(me["ref_count"])
+    step_in_cycle = ref_cnt % 3
+    progress_bar = "🟩" * step_in_cycle + "⬜️" * (3 - step_in_cycle)
+    left_for_vip = 3 - step_in_cycle
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+    text = (
+        "🎁 <b>Партнёрская программа и Бесплатный VIP</b>\n\n"
+        "Приглашай друзей по своей личной ссылке и получай жирные бонусы за каждого, кто создаст анкету!\n\n"
+        "💎 <b>Твои награды:</b>\n"
+        "• <b>За каждого друга:</b> +1 Супер-письмо 💌 и +6 часов ТОП-буста 🚀\n"
+        "• <b>За каждых 3 друзей:</b> 👑 <b>VIP-статус на 24 часа</b> автоматически!\n"
+        "• <b>Бонус с покупок:</b> если твой друг купит любую услугу в магазине, ты получишь ещё <b>+24ч VIP и +2 Супер-письма</b>!\n"
+        "• <b>Другу-новичку:</b> +2 Супер-письма на старте вместо 1!\n\n"
+        f"📊 <b>Твоя статистика:</b>\n"
+        f"👥 Приглашено друзей (с анкетой): <b>{ref_cnt} чел.</b>\n"
+        f"👑 Прогресс до следующего VIP: {progress_bar} (осталось: <b>{left_for_vip}</b>)\n\n"
+        f"🔗 <b>Твоя реферальная ссылка (нажми, чтобы скопировать):</b>\n"
+        f"<code>{ref_link}</code>"
+    )
+    await send_screen(bot, user_id, text, reply_markup=referral_kb(user_id))
 
 
 async def render_next_candidate(bot: Bot, user_id: int, prefix_notice: Optional[str] = None) -> None:
@@ -1035,7 +1196,7 @@ async def render_next_candidate(bot: Bot, user_id: int, prefix_notice: Optional[
         text += (
             "🔍 <b>Новые анкеты в твоей категории пока закончились!</b>\n\n"
             "Новые пользователи регистрируются каждый час.\n"
-            "💡 <i>Хочешь просмотреть заново тех, кого случайно пропустил(а)? Используй «🔄 Сброс пропущенных анкет» в магазине!</i>"
+            "💡 <i>Хочешь просмотреть заново тех, кого случайно пропустил(а)? Используй «🔄 Сброс пропущенных анкет» или позови друзей по рефералке!</i>"
         )
         kb_rows = []
         if is_adult_age(int(me["age"])) and PAYMENTS_ENABLED:
@@ -1045,6 +1206,7 @@ async def render_next_candidate(bot: Bot, user_id: int, prefix_notice: Optional[
             kb_rows.append(
                 [InlineKeyboardButton(text="🚀 Поднять мою анкету в ТОП", callback_data="shop:item:boost_24")]
             )
+        kb_rows.append([InlineKeyboardButton(text="🎁 Пригласить друзей (+VIP)", callback_data="menu:referral")])
         kb_rows.append([vpn_button()])
         kb_rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
         await send_screen(bot, user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
@@ -1095,6 +1257,31 @@ async def render_reg_step(bot: Bot, user_id: int, step: str, error_msg: Optional
         await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=True, skip_photo=True))
 
 
+async def notify_inviter_on_registration(bot: Bot, inviter_id: int, friend_name: str, new_ref_count: int) -> None:
+    vip_bonus_str = (
+        "\n👑 <b>СУПЕР-БОНУС: Ты пригласил(а) 3 друзей и получаешь +24 часа VIP-статуса и +1 Супер-письмо!</b>"
+        if new_ref_count % 3 == 0
+        else f"\n👑 До бесплатного VIP осталось пригласить: <b>{3 - (new_ref_count % 3)} чел.</b>"
+    )
+    try:
+        await bot.send_message(
+            inviter_id,
+            f"🎉 <b>Твой друг {html.escape(friend_name)} создал(а) анкету по твоей ссылке!</b>\n\n"
+            f"🎁 Тебе начислено:\n"
+            f"• <b>+1 Супер-письмо 💌</b>\n"
+            f"• <b>+6 часов поднятия анкеты в ТОП 🚀</b>"
+            f"{vip_bonus_str}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🎁 Моя рефералка", callback_data="menu:referral")],
+                    [vpn_button()],
+                ]
+            ),
+        )
+    except Exception:
+        pass
+
+
 # =========================
 # HANDLERS
 # =========================
@@ -1102,12 +1289,26 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     await safe_delete_message(bot, message.chat.id, message.message_id)
-    if get_profile(message.from_user.id):
-        update_username(message.from_user.id, message.from_user.username)
-    await render_home(bot, message.from_user.id)
+
+    user_id = message.from_user.id
+    args = (command.args or "").strip()
+
+    # Обработка реферальной ссылки вида ?start=ref_123456
+    ref_notice = None
+    if args.startswith("ref_"):
+        raw_inv = args.replace("ref_", "").strip()
+        if raw_inv.isdigit():
+            inviter_id = int(raw_inv)
+            if save_pending_referral(user_id, inviter_id):
+                ref_notice = "🎁 <b>Ты перешёл(ла) по приглашению друга!</b>\nСоздай анкету сейчас и получи <b>2 Супер-письма 💌</b> в подарок!"
+
+    if get_profile(user_id):
+        update_username(user_id, message.from_user.username)
+
+    await render_home(bot, user_id, notice=ref_notice)
 
 
 @dp.message(Command("paysupport"))
@@ -1145,7 +1346,7 @@ async def handle_support_text(message: Message, state: FSMContext, bot: Bot) -> 
     await render_home(bot, message.from_user.id, notice="✅ <b>Твоё обращение отправлено в поддержку!</b>")
 
 
-# --- АДМИН-ПАНЕЛЬ ДЛЯ МАКСИМАЛЬНОГО ДОХОДА (/admin) ---
+# --- АДМИН-ПАНЕЛЬ (/admin) ---
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     await safe_delete_message(bot, message.chat.id, message.message_id)
@@ -1161,6 +1362,9 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     cur.execute("SELECT COUNT(*) AS cnt FROM profiles WHERE vip_until > ?", (now_ts(),))
     vip_users = int(cur.fetchone()["cnt"])
 
+    cur.execute("SELECT COUNT(*) AS cnt FROM profiles WHERE referred_by > 0")
+    ref_invited = int(cur.fetchone()["cnt"])
+
     cur.execute(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS rev, COALESCE(SUM(commission), 0) AS comm FROM orders WHERE status = 'paid'"
     )
@@ -1173,6 +1377,7 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     text = (
         "👑 <b>Панель управления и Монетизации</b>\n\n"
         f"👥 Всего анкет в базе: <b>{total_users}</b>\n"
+        f"🤝 Пришли по рефералке: <b>{ref_invited}</b>\n"
         f"💎 Активных VIP-подписок: <b>{vip_users}</b>\n"
         f"💳 Успешных оплат: <b>{paid_orders}</b>\n"
         f"💰 Общий оборот: <b>{total_rev} ₽</b>\n"
@@ -1183,10 +1388,55 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📢 Сделать рассылку по базе", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(text="🎁 Выдать VIP на 7 дней по ID", callback_data="admin:gift_vip")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
         ]
     )
     await send_screen(bot, message.from_user.id, text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "admin:gift_vip")
+async def cb_admin_gift_vip(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    await callback.answer()
+    await state.set_state(AdminGiftState.waiting_user_id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home")]]
+    )
+    await send_screen(
+        bot,
+        callback.from_user.id,
+        "🎁 <b>Отправь Telegram ID пользователя, которому нужно начислить 7 дней VIP + 3 Супер-письма:</b>",
+        reply_markup=kb,
+    )
+
+
+@dp.message(AdminGiftState.waiting_user_id)
+async def handle_admin_gift_vip(message: Message, state: FSMContext, bot: Bot) -> None:
+    await safe_delete_message(bot, message.chat.id, message.message_id)
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not get_profile(int(raw)):
+        await render_home(bot, message.from_user.id, notice="⚠️ <b>Пользователь с таким ID не найден в базе анкет.</b>")
+        return
+
+    target_uid = int(raw)
+    add_vip_days(target_uid, 7, bonus_superlikes=3)
+    try:
+        await bot.send_message(
+            target_uid,
+            "👑 <b>Администратор начислил тебе VIP-статус на 7 дней и +3 Супер-письма!</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
+        )
+    except Exception:
+        pass
+
+    await render_home(bot, message.from_user.id, notice=f"✅ <b>VIP на 7 дней выдан пользователю {target_uid}!</b>")
 
 
 @dp.callback_query(F.data == "admin:broadcast")
@@ -1237,7 +1487,7 @@ async def handle_admin_broadcast(message: Message, state: FSMContext, bot: Bot) 
     await render_home(bot, message.from_user.id, notice=f"✅ <b>Рассылка завершена! Доставлено: {sent} чел.</b>")
 
 
-# --- НАВИГАЦИЯ ПО МЕНЮ ---
+# --- НАВИГАЦИЯ ПО МЕНЮ И РЕФЕРАЛКЕ ---
 @dp.callback_query(F.data == "menu:home")
 async def cb_home(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await state.clear()
@@ -1250,6 +1500,38 @@ async def cb_me(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     await callback.answer()
     await render_home(bot, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "menu:referral")
+async def cb_referral(callback: CallbackQuery, bot: Bot) -> None:
+    await callback.answer()
+    await render_referral_screen(bot, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "ref:leaderboard")
+async def cb_ref_leaderboard(callback: CallbackQuery, bot: Bot) -> None:
+    await callback.answer()
+    top_rows = get_top_referrers(limit=10)
+
+    lines = ["🏆 <b>ТОП-10 амбассадоров «Лавчика»</b>\n"]
+    if not top_rows:
+        lines.append("<i>Пока никто не пригласил друзей. Стань первым в рейтинге и забери бесплатный VIP!</i>")
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, r in enumerate(top_rows, start=1):
+            badge = medals[idx - 1] if idx <= 3 else f"{idx}."
+            vip_mark = " 👑" if int(r["vip_until"]) > now_ts() else ""
+            lines.append(
+                f"{badge} <b>{html.escape(str(r['name']))}, {r['age']}</b> ({html.escape(str(r['city']))}){vip_mark} — <b>{r['ref_count']} др.</b>"
+            )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад к моей ссылке", callback_data="menu:referral")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+        ]
+    )
+    await send_screen(bot, callback.from_user.id, "\n".join(lines), reply_markup=kb)
 
 
 @dp.callback_query(F.data == "menu:browse")
@@ -1426,7 +1708,7 @@ async def reg_bio(message: Message, state: FSMContext, bot: Bot) -> None:
 async def reg_skip_photo(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await callback.answer()
     data = await state.get_data()
-    upsert_profile(
+    is_new, inviter_id, new_ref_cnt = upsert_profile(
         user_id=callback.from_user.id,
         username=callback.from_user.username,
         name=data["name"],
@@ -1436,7 +1718,16 @@ async def reg_skip_photo(callback: CallbackQuery, state: FSMContext, bot: Bot) -
         photo_id=None,
     )
     await state.clear()
-    await render_home(bot, callback.from_user.id, notice="🎉 <b>Анкета успешно сохранена!</b>")
+
+    if is_new and inviter_id:
+        await notify_inviter_on_registration(bot, inviter_id, data["name"], new_ref_cnt)
+        await render_home(
+            bot,
+            callback.from_user.id,
+            notice="🎉 <b>Анкета сохранена! Тебе начислено 2 Супер-письма 💌 по приглашению друга!</b>",
+        )
+    else:
+        await render_home(bot, callback.from_user.id, notice="🎉 <b>Анкета успешно сохранена!</b>")
 
 
 @dp.message(RegStates.photo)
@@ -1453,7 +1744,7 @@ async def reg_photo(message: Message, state: FSMContext, bot: Bot) -> None:
 
     photo_id = message.photo[-1].file_id
     data = await state.get_data()
-    upsert_profile(
+    is_new, inviter_id, new_ref_cnt = upsert_profile(
         user_id=message.from_user.id,
         username=message.from_user.username,
         name=data["name"],
@@ -1463,7 +1754,16 @@ async def reg_photo(message: Message, state: FSMContext, bot: Bot) -> None:
         photo_id=photo_id,
     )
     await state.clear()
-    await render_home(bot, message.from_user.id, notice="🎉 <b>Анкета с фото успешно сохранена!</b>")
+
+    if is_new and inviter_id:
+        await notify_inviter_on_registration(bot, inviter_id, data["name"], new_ref_cnt)
+        await render_home(
+            bot,
+            message.from_user.id,
+            notice="🎉 <b>Анкета с фото сохранена! Тебе начислено 2 Супер-письма 💌 по приглашению друга!</b>",
+        )
+    else:
+        await render_home(bot, message.from_user.id, notice="🎉 <b>Анкета с фото успешно сохранена!</b>")
 
 
 # --- ЛАЙКИ, СУПЕР-ПИСЬМА, МАТЧИ И "КТО ЛАЙКНУЛ" ---
@@ -1490,10 +1790,9 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
         await render_next_candidate(bot, user_id)
         return
 
-    # 1. СУПЕР-ПИСЬМО (Написать сразу)
     if action == "super":
         if int(me["superlikes"]) <= 0:
-            await callback.answer("У тебя закончились Супер-письма! Пополни их в магазине.", show_alert=True)
+            await callback.answer("У тебя закончились Супер-письма! Пополни их или пригласи друга.", show_alert=True)
             await render_shop_item(bot, user_id, "super_5")
             return
 
@@ -1518,7 +1817,6 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
         )
         return
 
-    # 2. ПРОПУСК / ЧС / ЖАЛОБА
     if action == "skip":
         add_reaction(user_id, target_id, "skip")
         await callback.answer("Пропущено 👎")
@@ -1550,7 +1848,6 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
         await render_next_candidate(bot, user_id)
         return
 
-    # 3. ЛАЙК (с проверкой дневного лимита для не-VIP)
     if action == "like":
         if not is_vip(me) and is_adult_age(int(me["age"])):
             today_cnt = count_today_likes(user_id)
@@ -1560,7 +1857,7 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
                     bot,
                     user_id,
                     "vip_7",
-                    custom_notice=f"🔥 <b>Ты поставил(а) максимум бесплатных лайков за сегодня ({FREE_DAILY_LIKES} из {FREE_DAILY_LIKES})!</b>\nПодключи VIP, чтобы лайкать без ограничений:",
+                    custom_notice=f"🔥 <b>Ты поставил(а) максимум бесплатных лайков за сегодня ({FREE_DAILY_LIKES} из {FREE_DAILY_LIKES})!</b>\nПодключи VIP или пригласи друзей, чтобы лайкать без ограничений:",
                 )
                 return
 
@@ -1570,7 +1867,11 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
             add_match(user_id, target_id)
             await callback.answer("🎉 Взаимная симпатия!")
 
-            my_link = f"@{me['username']}" if me["username"] else f"<a href='tg://user?id={user_id}'>{html.escape(me['name'])}</a>"
+            my_link = (
+                f"@{me['username']}"
+                if me["username"]
+                else f"<a href='tg://user?id={user_id}'>{html.escape(me['name'])}</a>"
+            )
             target_link = (
                 f"@{target['username']}"
                 if target["username"]
@@ -1595,7 +1896,6 @@ async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: B
             await render_next_candidate(bot, user_id, prefix_notice=notice)
         else:
             await callback.answer("❤️ Лайк отправлен!")
-            # Уведомляем второго пользователя (триггер покупки VIP "Кто меня лайкнул")
             try:
                 await bot.send_message(
                     target_id,
@@ -1669,7 +1969,7 @@ async def handle_super_msg(message: Message, state: FSMContext, bot: Bot) -> Non
     )
 
 
-# --- КТО МЕНЯ ЛАЙКНУЛ (МОНЕТИЗАЦИЯ VIP) ---
+# --- КТО МЕНЯ ЛАЙКНУЛ ---
 @dp.callback_query(F.data == "menu:who_liked")
 async def cb_who_liked(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
@@ -1683,11 +1983,12 @@ async def cb_who_liked(callback: CallbackQuery, bot: Bot) -> None:
     if not incoming:
         text = (
             "👀 <b>Новых входящих лайков пока нет</b>\n\n"
-            "💡 <i>Совет: подними анкету в ТОП на 24 часа, чтобы получать в 5 раз больше симпатий!</i>"
+            "💡 <i>Совет: подними анкету в ТОП или пригласи друзей, чтобы получать в 5 раз больше симпатий!</i>"
         )
         rows = []
         if is_adult_age(int(me["age"])) and PAYMENTS_ENABLED:
             rows.append([InlineKeyboardButton(text="🚀 Поднять анкету в ТОП", callback_data="shop:item:boost_24")])
+        rows.append([InlineKeyboardButton(text="🎁 Бесплатный VIP за друзей", callback_data="menu:referral")])
         rows.append([vpn_button()])
         rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
         await send_screen(bot, user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1712,7 +2013,7 @@ async def cb_who_liked(callback: CallbackQuery, bot: Bot) -> None:
         text = (
             f"🔥 <b>Твоя анкета понравилась {len(incoming)} чел.!</b>\n\n"
             f"👤 <b>{masked_name}, {adm['age']}</b>  📍 <i>{city}</i>\n"
-            f"<blockquote>🔒 Фотография и контакты скрыты. Подключи VIP-статус, чтобы сразу видеть всех, кто тебя лайкает, и общаться без ограничений!</blockquote>"
+            f"<blockquote>🔒 Фотография и контакты скрыты. Подключи VIP-статус (или пригласи 3 друзей бесплатно), чтобы сразу видеть всех, кто тебя лайкает!</blockquote>"
         )
         await send_screen(bot, user_id, text, reply_markup=who_liked_kb(int(adm["user_id"]), False))
 
@@ -1743,7 +2044,7 @@ async def cb_matches(callback: CallbackQuery, bot: Bot) -> None:
 
 
 # =========================
-# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ)
+# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ + БОНУС РЕФОВОДУ)
 # =========================
 async def render_shop_item(
     bot: Bot,
@@ -1862,6 +2163,22 @@ async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
     else:
         reward_msg = "✅ <b>Оплата прошла успешно!</b>"
 
+    # Начисляем реферальный бонус пригласившему за покупку друга (+24ч VIP и +2 Супер-письма)
+    me = get_profile(user_id)
+    if me and int(me["referred_by"]) > 0:
+        inviter_id = int(me["referred_by"])
+        if get_profile(inviter_id):
+            add_vip_days(inviter_id, 1, bonus_superlikes=2)
+            try:
+                await bot.send_message(
+                    inviter_id,
+                    "💎 <b>Партнёрский бонус!</b>\n"
+                    "Приглашённый тобой друг совершил покупку в магазине — тебе начислено <b>+24 часа VIP 👑 и +2 Супер-письма 💌</b>!",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
+                )
+            except Exception:
+                pass
+
     if ADMIN_ID:
         try:
             await bot.send_message(
@@ -1878,7 +2195,6 @@ async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
     await render_home(bot, user_id, notice=reward_msg)
 
 
-# Чистим любые случайные сообщения вне сценариев, чтобы не засорять чат
 @dp.message()
 async def fallback_cleanup(message: Message, bot: Bot) -> None:
     await safe_delete_message(bot, message.chat.id, message.message_id)
@@ -1893,7 +2209,6 @@ async def health_handler(request: web.Request) -> web.Response:
 
 
 async def start_dummy_webserver() -> web.AppRunner:
-    """Запускает легкий веб-сервер на порту $PORT (или 8080), чтобы облачный хостинг не присылал SIGTERM."""
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
@@ -1910,6 +2225,7 @@ async def start_dummy_webserver() -> web.AppRunner:
 # ENTRYPOINT
 # =========================
 async def main() -> None:
+    global BOT_USERNAME
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         logging.error("❌ ОШИБКА: BOT_TOKEN не задан или имеет неверный формат! Проверьте файл .env")
         return
@@ -1924,7 +2240,9 @@ async def main() -> None:
 
     try:
         me = await bot.get_me()
-        logging.info(f"✅ Авторизация успешна: @{me.username} (ID: {me.id})")
+        if me.username:
+            BOT_USERNAME = me.username
+        logging.info(f"✅ Авторизация успешна: @{BOT_USERNAME} (ID: {me.id})")
 
         await bot.set_my_commands(
             [
