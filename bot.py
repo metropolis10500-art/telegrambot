@@ -1,4 +1,3 @@
-```python
 import asyncio
 from datetime import datetime, timezone
 import html
@@ -24,6 +23,7 @@ from aiogram.types import (
     Message,
 )
 import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
 
 # ============================================================
@@ -241,7 +241,6 @@ async def send_screen(
         if delete_user_msg:
             await delete_msg_safe(bot, chat_id, event.message_id)
 
-    # Удаляем предыдущее сохранённое сообщение бота, если оно осталось
     old_bot_msg = last_bot_messages.get(user_id)
     if old_bot_msg:
         await delete_msg_safe(bot, chat_id, old_bot_msg)
@@ -638,7 +637,7 @@ async def start(message: Message, state: FSMContext):
 
     await send_screen(
         message,
-        "💘 <b>Добро пожаловать в бот знакомств!</b>\n\n"
+        "💘 <b>Добро пожаловать в Лавчик!</b>\n\n"
         "Здесь ты легко найдёшь новых друзей, компанию для прогулок или вторую половинку.\n\n"
         "<blockquote>"
         "✨ Удобный интерфейс без лишнего спама\n"
@@ -975,7 +974,6 @@ async def like(callback: CallbackQuery):
         await show_candidate(callback, user_id)
         return
 
-    # Проверка дневного лимита лайков для бесплатных аккаунтов
     if not is_vip(viewer) and get_today_likes_count(user_id) >= FREE_DAILY_LIKES:
         await callback.answer("🛑 Дневной лимит лайков исчерпан!", show_alert=True)
         await send_screen(
@@ -1072,7 +1070,6 @@ async def like(callback: CallbackQuery):
         )
         return
     else:
-        # ТРИГГЕР ПРОДАЖ: уведомляем второго пользователя, что его кто-то лайкнул!
         try:
             await callback.bot.send_message(
                 target_id,
@@ -2008,7 +2005,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
                 row["user_id"],
                 text,
                 reply_markup=buttons(
-                    [[("🔥 Открыть бот", "menu")], [VPN_BUTTON]]
+                    [[("🔥 Открыть Лавчик", "menu")], [VPN_BUTTON]]
                 ),
             )
             sent_count += 1
@@ -2024,6 +2021,32 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
 
 
 # ============================================================
+# ФОНОВЫЙ ВЕБ-СЕРВЕР (ЗАЩИТА ОТ SIGTERM НА ХОСТИНГАХ)
+# ============================================================
+async def health_check(request):
+    return web.Response(text="Bot @lovchik_tg_bot is running 24/7!")
+
+
+async def start_dummy_webserver():
+    """Открывает порт для Health Check хостинга, чтобы контейнер не выключали."""
+    try:
+        app = web.Application()
+        app.router.add_get("/", health_check)
+        app.router.add_get("/health", health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        port = int(os.getenv("PORT", "8080"))
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        logging.info("🌐 Веб-сервер для Health Check запущен на порту %s", port)
+        return runner
+    except OSError as e:
+        logging.warning("Веб-порт уже занят или не требуется: %s", e)
+        return None
+
+
+# ============================================================
 # ЗАПУСК БОТА
 # ============================================================
 async def main():
@@ -2031,7 +2054,10 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    web_runner = None
     try:
+        web_runner = await start_dummy_webserver()
+
         me = await bot.get_me()
         logging.info("✅ Успешный вход: @%s (ID: %s)", me.username, me.id)
 
@@ -2045,6 +2071,7 @@ async def main():
             ]
         )
         logging.info("🚀 Бот запущен и готов к работе!")
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
 
     except TelegramUnauthorizedError:
@@ -2059,10 +2086,11 @@ async def main():
             masked,
         )
     finally:
+        if web_runner:
+            await web_runner.cleanup()
         await bot.session.close()
         db.close()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
