@@ -9,7 +9,7 @@ import sqlite3
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,18 +27,27 @@ from dotenv import load_dotenv
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-load_dotenv()
+# override=True заставляет брать свежие данные из .env, даже если хостинг закешировал старые
+load_dotenv(override=True)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_PATH = os.getenv("DB_PATH", "dating_bot.sqlite3")
-BOOST_PRICE_STARS = int(os.getenv("BOOST_PRICE_STARS", "25"))
-PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "0") == "1"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
+DB_PATH = os.getenv("DB_PATH", "dating_bot.sqlite3").strip()
+BOOST_PRICE_STARS = int(os.getenv("BOOST_PRICE_STARS", "25").strip() or "25")
+PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "0").strip() == "1"
 
-if not BOT_TOKEN or "НОВЫЙ_ТОКЕН" in BOT_TOKEN:
-    raise SystemExit("ОШИБКА: Укажи корректный BOT_TOKEN в файле .env")
+if (
+    not BOT_TOKEN
+    or ":" not in BOT_TOKEN
+    or "НОВЫЙ_ТОКЕН" in BOT_TOKEN
+    or "вставь_сюда" in BOT_TOKEN
+):
+    raise SystemExit(
+        "❌ ОШИБКА: Укажи настоящий BOT_TOKEN от @BotFather в файле .env или настройках хостинга!"
+    )
+
 if BOOST_PRICE_STARS < 1:
-    raise SystemExit("ОШИБКА: BOOST_PRICE_STARS должен быть больше нуля")
+    raise SystemExit("❌ ОШИБКА: BOOST_PRICE_STARS должен быть больше нуля")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,14 +122,13 @@ db.executescript(
         created_at TEXT NOT NULL
     );
 
-    -- Индексы для ускорения поиска
     CREATE INDEX IF NOT EXISTS idx_profiles_search ON profiles(active, age, boost_until);
     CREATE INDEX IF NOT EXISTS idx_reactions_user ON reactions(user_id, target_id);
     CREATE INDEX IF NOT EXISTS idx_blocks_pair ON blocks(user_id, blocked_id);
     """
 )
 
-# Автоматическое обновление старой БД (если таблица была создана без photo_id и username)
+# Автоматическое добавление новых колонок, если база осталась от старой версии
 existing_columns = {
     row["name"] for row in db.execute("PRAGMA table_info(profiles)").fetchall()
 }
@@ -298,7 +306,6 @@ async def start(message: Message, state: FSMContext):
     await state.clear()
     profile = get_profile(message.from_user.id)
     if profile:
-        # Обновляем username, если пользователь его сменил
         if profile["username"] != message.from_user.username:
             db.execute(
                 "UPDATE profiles SET username = ? WHERE user_id = ?",
@@ -397,7 +404,6 @@ async def finish_profile_saving(
     old_profile = get_profile(user_id)
 
     with db:
-        # При смене возрастной категории (14-17 <-> 18+) сбрасываем старые связи
         if old_profile and age_group(old_profile["age"]) != age_group(
             data["age"]
         ):
@@ -464,7 +470,7 @@ async def form_photo_skipped(callback: CallbackQuery, state: FSMContext):
 @dp.message(ProfileForm.photo)
 async def form_photo_invalid(message: Message):
     await message.answer(
-        "Пожалуйста, отправь фотографию (не файлом) или нажми кнопку «Пропустить фото»."
+        "Пожалуйста, отправь фотографию (как картинку, а не файл) или нажми кнопку «Пропустить фото»."
     )
 
 
@@ -1107,16 +1113,34 @@ async def main():
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Главное меню"),
-            BotCommand(command="cancel", description="Отменить ввод"),
-            BotCommand(command="paysupport", description="Помощь с оплатой"),
-        ]
-    )
-    logging.info("Бот успешно запущен!")
     try:
+        me = await bot.get_me()
+        logging.info("✅ Успешный вход: @%s (ID: %s)", me.username, me.id)
+
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="cancel", description="Отменить ввод"),
+                BotCommand(
+                    command="paysupport", description="Помощь с оплатой"
+                ),
+            ]
+        )
+        logging.info("🚀 Бот запущен и готов к работе!")
         await dp.start_polling(bot)
+
+    except TelegramUnauthorizedError:
+        masked = (
+            f"{BOT_TOKEN[:6]}...{BOT_TOKEN[-4:]}"
+            if len(BOT_TOKEN) > 10
+            else BOT_TOKEN
+        )
+        logging.error(
+            "❌ ОШИБКА АВТОРИЗАЦИИ: Telegram отклонил токен [%s].\n"
+            "1. Зайди в @BotFather -> /revoke и получи новый токен.\n"
+            "2. Вставь новый токен в файл .env И в настройки переменных (Variables) на хостинге!",
+            masked,
+        )
     finally:
         await bot.session.close()
         db.close()
