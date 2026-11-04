@@ -1,5 +1,4 @@
 import asyncio
-import html
 import logging
 import math
 import os
@@ -8,14 +7,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -29,776 +28,120 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-# Перезаписываем переменные окружения из файла .env
+# =========================
+# ЗАГРУЗКА НАСТРОЕК (.env)
+# =========================
 load_dotenv(override=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-# =========================
-# CONFIG (.env)
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 DB_PATH = os.getenv("DB_PATH", "dating_bot.sqlite3").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
-PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "1").strip() == "1"
 
-# Настройки ЮMoney (yoomoney.ru) и комиссии 30%
-YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "").strip().strip('"').strip("'")
-YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
+PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "1").strip() == "1"
 COMMISSION_PERCENT = int(os.getenv("COMMISSION_PERCENT", "30").strip() or 30)
 
-# Партнерская кнопка Velvet VPN
-VELVET_VPN_URL = "https://t.me/velvet?start=3SLkWOoF"
-VELVET_VPN_TEXT = "💎 Velvet VPN › Доступно всё"
+YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "410010000000000").strip()
+YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
 
-# Лимиты для монетизации
+# Ссылки партнёра и технической поддержки
+VELVET_VPN_URL = "https://t.me/velvet?start=3SLkWOoF"
+SUPPORT_URL = "https://t.me/vladofix97"
+SUPPORT_USERNAME = "@vladofix97"
+
 FREE_DAILY_LIKES = 25
 
-# Имя бота (обновляется автоматически при запуске)
-BOT_USERNAME = "lovchik_tg_bot"
-
-# Хранилище последнего сообщения бота для каждого пользователя (для автоудаления)
-last_bot_messages: Dict[int, int] = {}
-
-# Защита от спама кнопкой "Проверить оплату" (order_id -> timestamp последнего уведомления админу)
+# Временное хранилище ID последних сообщений бота для чистоты чата
+last_bot_messages: Dict[int, List[int]] = {}
+# Защита от спама уведомлениями админу при проверке оплаты (order_id -> timestamp)
 admin_notified_orders: Dict[str, int] = {}
+BOT_USERNAME: str = ""
 
 
 # =========================
-# PRODUCTS & PRICING (+30% КОМИССИЯ)
+# ТАРИФЫ И УСЛУГИ МАГАЗИНА
 # =========================
-@dataclass
+@dataclass(frozen=True)
 class Product:
-    code: str
+    key: str
     title: str
     description: str
     base_price_rub: int
-    emoji: str
 
 
 PRODUCTS: Dict[str, Product] = {
     "vip_7": Product(
-        code="vip_7",
+        key="vip_7",
         title="👑 VIP-статус на 7 дней",
-        description="Безлимит лайков, просмотр тех, кто тебя лайкнул, приоритет в поиске и +3 Супер-письма в подарок.",
+        description="• Просмотр всех, кто тебя лайкнул\n• Безлимитные лайки\n• +3 💌 Супер-письма в подарок\n• Значок 👑 VIP в анкете",
         base_price_rub=290,
-        emoji="👑",
     ),
     "vip_30": Product(
-        code="vip_30",
+        key="vip_30",
         title="👑 VIP-статус на 30 дней (ХИТ)",
-        description="Полный доступ ко всем функциям на месяц + 10 Супер-писем и золотой значок в анкете.",
+        description="• Все привилегии VIP на целый месяц\n• +10 💌 Супер-писем в подарок\n• Максимальный приоритет показа",
         base_price_rub=690,
-        emoji="💎",
     ),
     "boost_24": Product(
-        code="boost_24",
+        key="boost_24",
         title="🚀 Поднятие в ТОП на 24 часа",
-        description="Твоя анкета показывается первой всем пользователям твоего возраста. В 5 раз больше взаимных симпатий!",
+        description="• Твоя анкета показывается первой всем пользователям твоего возраста 24 часа",
         base_price_rub=149,
-        emoji="🚀",
     ),
     "super_5": Product(
-        code="super_5",
+        key="super_5",
         title="💌 Пакет: 5 Супер-писем",
-        description="Пиши личные сообщения понравившимся людям сразу с передачей своего контакта, не дожидаясь взаимного лайка!",
+        description="• Напиши личное сообщение любому человеку сразу, не дожидаясь взаимного лайка!",
         base_price_rub=199,
-        emoji="💌",
     ),
     "reset_skips": Product(
-        code="reset_skips",
+        key="reset_skips",
         title="🔄 Сброс пропущенных анкет",
-        description="Верни в поиск всех, кого ты случайно пропустил(а) (нажал 👎), и посмотри их анкеты заново.",
+        description="• Очистить историю «Дальше 👎» и снова увидеть всех пропущенных пользователей",
         base_price_rub=99,
-        emoji="🔄",
     ),
 }
 
 
 def calc_price_with_commission(base_price: int) -> Tuple[int, int, int]:
-    """Возвращает (базовая_цена, сумма_комиссии_30%, итого_к_оплате)."""
+    """Возвращает (базовая_цена, комиссия_30_процентов, итого_к_оплате)."""
     commission = math.ceil(base_price * (COMMISSION_PERCENT / 100.0))
     total = base_price + commission
     return base_price, commission, total
 
 
-# =========================
-# DATABASE & MIGRATIONS
-# =========================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            name TEXT NOT NULL,
-            age INTEGER NOT NULL,
-            city TEXT NOT NULL,
-            bio TEXT NOT NULL,
-            photo_id TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            boost_until INTEGER NOT NULL DEFAULT 0,
-            vip_until INTEGER NOT NULL DEFAULT 0,
-            superlikes INTEGER NOT NULL DEFAULT 1,
-            referred_by INTEGER NOT NULL DEFAULT 0,
-            ref_count INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    cur.execute("PRAGMA table_info(profiles)")
-    p_cols = [r["name"] for r in cur.fetchall()]
-    if "vip_until" not in p_cols:
-        cur.execute("ALTER TABLE profiles ADD COLUMN vip_until INTEGER NOT NULL DEFAULT 0")
-    if "superlikes" not in p_cols:
-        cur.execute("ALTER TABLE profiles ADD COLUMN superlikes INTEGER NOT NULL DEFAULT 1")
-    if "referred_by" not in p_cols:
-        cur.execute("ALTER TABLE profiles ADD COLUMN referred_by INTEGER NOT NULL DEFAULT 0")
-    if "ref_count" not in p_cols:
-        cur.execute("ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0")
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pending_referrals (
-            user_id INTEGER PRIMARY KEY,
-            inviter_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reactions (
-            user_id INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (user_id, target_id)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS matches (
-            user1 INTEGER NOT NULL,
-            user2 INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (user1, user2)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS blocks (
-            user_id INTEGER NOT NULL,
-            blocked_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (user_id, blocked_id)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter_id INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-            order_id TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            product TEXT NOT NULL,
-            base_amount INTEGER NOT NULL DEFAULT 0,
-            commission INTEGER NOT NULL DEFAULT 0,
-            amount INTEGER NOT NULL,
-            currency TEXT NOT NULL,
-            status TEXT NOT NULL,
-            telegram_charge_id TEXT,
-            created_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    cur.execute("PRAGMA table_info(orders)")
-    o_cols = [r["name"] for r in cur.fetchall()]
-    if "base_amount" not in o_cols:
-        cur.execute("ALTER TABLE orders ADD COLUMN base_amount INTEGER NOT NULL DEFAULT 0")
-    if "commission" not in o_cols:
-        cur.execute("ALTER TABLE orders ADD COLUMN commission INTEGER NOT NULL DEFAULT 0")
-
-    conn.commit()
-    conn.close()
-
-
-# =========================
-# AGE & STATUS HELPERS
-# =========================
-def now_ts() -> int:
-    return int(time.time())
-
-
-def is_minor_age(age: int) -> bool:
-    return 14 <= age <= 17
-
-
-def is_adult_age(age: int) -> bool:
-    return age >= 18
-
-
-def age_group(age: int) -> str:
-    if is_minor_age(age):
-        return "minor"
-    if is_adult_age(age):
-        return "adult"
-    return "invalid"
-
-
-def same_age_group(age1: int, age2: int) -> bool:
-    g1 = age_group(age1)
-    g2 = age_group(age2)
-    return g1 == g2 and g1 in ("minor", "adult")
-
-
-def is_boosted(row: sqlite3.Row) -> bool:
-    return int(row["boost_until"]) > now_ts()
-
-
-def is_vip(row: sqlite3.Row) -> bool:
-    return int(row["vip_until"]) > now_ts()
-
-
-# =========================
-# DB QUERIES & REFERRAL LOGIC
-# =========================
-def get_profile(user_id: int) -> Optional[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM profiles WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def save_pending_referral(user_id: int, inviter_id: int) -> bool:
-    if user_id == inviter_id or inviter_id <= 0:
-        return False
-    if get_profile(user_id) is not None:
-        return False
-    inviter = get_profile(inviter_id)
-    if not inviter:
-        return False
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO pending_referrals (user_id, inviter_id, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (user_id, inviter_id, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-    return True
-
-
-def upsert_profile(
-    user_id: int,
-    username: Optional[str],
-    name: str,
-    age: int,
-    city: str,
-    bio: str,
-    photo_id: Optional[str],
-) -> Tuple[bool, Optional[int], int]:
-    conn = db()
-    cur = conn.cursor()
-    existing = get_profile(user_id)
-
-    if existing:
-        cur.execute(
-            """
-            UPDATE profiles
-            SET username = ?, name = ?, age = ?, city = ?, bio = ?, photo_id = ?, active = 1
-            WHERE user_id = ?
-            """,
-            (username, name, age, city, bio, photo_id, user_id),
-        )
-        conn.commit()
-        conn.close()
-        return False, None, 0
-
-    cur.execute("SELECT inviter_id FROM pending_referrals WHERE user_id = ?", (user_id,))
-    pend = cur.fetchone()
-    inviter_id = int(pend["inviter_id"]) if pend else 0
-
-    initial_superlikes = 2 if inviter_id > 0 else 1
-
-    cur.execute(
-        """
-        INSERT INTO profiles (
-            user_id, username, name, age, city, bio, photo_id,
-            active, boost_until, vip_until, superlikes, referred_by, ref_count, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, 0, ?)
-        """,
-        (user_id, username, name, age, city, bio, photo_id, initial_superlikes, inviter_id, now_ts()),
-    )
-
-    if pend:
-        cur.execute("DELETE FROM pending_referrals WHERE user_id = ?", (user_id,))
-
-    conn.commit()
-    conn.close()
-
-    if inviter_id > 0 and get_profile(inviter_id):
-        conn2 = db()
-        cur2 = conn2.cursor()
-        cur2.execute("UPDATE profiles SET ref_count = ref_count + 1 WHERE user_id = ?", (inviter_id,))
-        cur2.execute("SELECT ref_count FROM profiles WHERE user_id = ?", (inviter_id,))
-        r_row = cur2.fetchone()
-        new_ref_count = int(r_row["ref_count"]) if r_row else 1
-        conn2.commit()
-        conn2.close()
-
-        add_superlikes(inviter_id, 1)
-        add_boost_hours(inviter_id, 6)
-
-        if new_ref_count % 3 == 0:
-            add_vip_days(inviter_id, 1, bonus_superlikes=1)
-
-        return True, inviter_id, new_ref_count
-
-    return True, None, 0
-
-
-def get_top_referrers(limit: int = 10) -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT name, age, city, ref_count, vip_until
-        FROM profiles
-        WHERE ref_count > 0
-        ORDER BY ref_count DESC, created_at ASC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def update_username(user_id: int, username: Optional[str]) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE profiles SET username = ? WHERE user_id = ?", (username, user_id))
-    conn.commit()
-    conn.close()
-
-
-def set_active(user_id: int, active: bool) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE profiles SET active = ? WHERE user_id = ?", (1 if active else 0, user_id))
-    conn.commit()
-    conn.close()
-
-
-def delete_profile(user_id: int) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
-    cur.execute("DELETE FROM reactions WHERE user_id = ? OR target_id = ?", (user_id, user_id))
-    cur.execute("DELETE FROM matches WHERE user1 = ? OR user2 = ?", (user_id, user_id))
-    cur.execute("DELETE FROM blocks WHERE user_id = ? OR blocked_id = ?", (user_id, user_id))
-    conn.commit()
-    conn.close()
-
-
-def add_reaction(user_id: int, target_id: int, action: str) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO reactions (user_id, target_id, action, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (user_id, target_id, action, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def count_today_likes(user_id: int) -> int:
-    since = now_ts() - 86400
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) AS cnt FROM reactions WHERE user_id = ? AND action = 'like' AND created_at >= ?",
-        (user_id, since),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return int(row["cnt"]) if row else 0
-
-
-def reset_user_skips(user_id: int) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM reactions WHERE user_id = ? AND action = 'skip'", (user_id,))
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    return deleted
-
-
-def has_liked(user_id: int, target_id: int) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM reactions WHERE user_id = ? AND target_id = ? AND action = 'like'",
-        (user_id, target_id),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def add_match(u1: int, u2: int) -> None:
-    a, b = sorted((u1, u2))
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO matches (user1, user2, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (a, b, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_matches(user_id: int) -> List[sqlite3.Row]:
-    me = get_profile(user_id)
-    if not me:
-        return []
-
-    my_age = int(me["age"])
-    if is_minor_age(my_age):
-        min_age, max_age = 14, 17
-    elif is_adult_age(my_age):
-        min_age, max_age = 18, 120
-    else:
-        return []
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT p.*
-        FROM matches m
-        JOIN profiles p
-          ON p.user_id = CASE
-              WHEN m.user1 = ? THEN m.user2
-              ELSE m.user1
-          END
-        WHERE (m.user1 = ? OR m.user2 = ?)
-          AND p.active = 1
-          AND p.age BETWEEN ? AND ?
-        ORDER BY m.created_at DESC
-        LIMIT 25
-        """,
-        (user_id, user_id, user_id, min_age, max_age),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_incoming_likes(user_id: int) -> List[sqlite3.Row]:
-    me = get_profile(user_id)
-    if not me:
-        return []
-
-    my_age = int(me["age"])
-    min_age, max_age = (14, 17) if is_minor_age(my_age) else (18, 120)
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT p.*
-        FROM reactions r
-        JOIN profiles p ON p.user_id = r.user_id
-        WHERE r.target_id = ?
-          AND r.action = 'like'
-          AND p.active = 1
-          AND p.age BETWEEN ? AND ?
-          AND p.user_id NOT IN (
-              SELECT target_id FROM reactions WHERE user_id = ?
-          )
-          AND p.user_id NOT IN (
-              SELECT blocked_id FROM blocks WHERE user_id = ?
-          )
-        ORDER BY r.created_at DESC
-        """,
-        (user_id, min_age, max_age, user_id, user_id),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def block_user(user_id: int, blocked_id: int) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO blocks (user_id, blocked_id, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (user_id, blocked_id, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def report_user(reporter_id: int, target_id: int) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO reports (reporter_id, target_id, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (reporter_id, target_id, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def add_boost_hours(user_id: int, hours: int) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT boost_until FROM profiles WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    now = now_ts()
-    current_until = int(row["boost_until"]) if row else 0
-    base = max(now, current_until)
-    new_until = base + hours * 3600
-    cur.execute("UPDATE profiles SET boost_until = ? WHERE user_id = ?", (new_until, user_id))
-    conn.commit()
-    conn.close()
-    return new_until
-
-
-def add_vip_days(user_id: int, days: int, bonus_superlikes: int = 0) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT vip_until, superlikes FROM profiles WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    now = now_ts()
-    current_until = int(row["vip_until"]) if row else 0
-    current_sl = int(row["superlikes"]) if row else 0
-    base = max(now, current_until)
-    new_until = base + days * 86400
-    cur.execute(
-        "UPDATE profiles SET vip_until = ?, superlikes = ? WHERE user_id = ?",
-        (new_until, current_sl + bonus_superlikes, user_id),
-    )
-    conn.commit()
-    conn.close()
-    return new_until
-
-
-def add_superlikes(user_id: int, count: int) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("UPDATE profiles SET superlikes = superlikes + ? WHERE user_id = ?", (count, user_id))
-    cur.execute("SELECT superlikes FROM profiles WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.commit()
-    conn.close()
-    return int(row["superlikes"]) if row else 0
-
-
-def use_superlike(user_id: int) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT superlikes FROM profiles WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    if not row or int(row["superlikes"]) <= 0:
-        conn.close()
-        return False
-    cur.execute("UPDATE profiles SET superlikes = superlikes - 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    return True
-
-
-def create_order(
-    order_id: str,
-    user_id: int,
-    product: str,
-    base_amount: int,
-    commission: int,
-    total_amount: int,
-    currency: str = "RUB",
-) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO orders (order_id, user_id, product, base_amount, commission, amount, currency, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-        """,
-        (order_id, user_id, product, base_amount, commission, total_amount, currency, now_ts()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_order(order_id: str) -> Optional[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def mark_order_paid(order_id: str, charge_id: str) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE orders
-        SET status = 'paid', telegram_charge_id = ?
-        WHERE order_id = ?
-        """,
-        (charge_id, order_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def apply_order_reward(user_id: int, prod_code: str) -> str:
-    """Начисляет привилегию пользователю и возвращает текст уведомления."""
-    if prod_code == "vip_7":
-        add_vip_days(user_id, 7, bonus_superlikes=3)
-        return "👑 <b>VIP-статус на 7 дней и +3 Супер-письма успешно активированы!</b>"
-    elif prod_code == "vip_30":
-        add_vip_days(user_id, 30, bonus_superlikes=10)
-        return "💎 <b>VIP-статус на 30 дней и +10 Супер-писем успешно активированы!</b>"
-    elif prod_code == "boost_24":
-        add_boost_hours(user_id, 24)
-        return "🚀 <b>Твоя анкета поднята в ТОП на 24 часа!</b>"
-    elif prod_code == "super_5":
-        add_superlikes(user_id, 5)
-        return "💌 <b>Тебе начислено +5 Супер-писем!</b>"
-    elif prod_code == "reset_skips":
-        reset_user_skips(user_id)
-        return "🔄 <b>Все пропущенные анкеты возвращены в поиск!</b>"
-    return "✅ <b>Оплата прошла успешно! Услуга активирована.</b>"
-
-
-def get_next_candidate(user_id: int) -> Optional[sqlite3.Row]:
-    me = get_profile(user_id)
-    if not me:
-        return None
-
-    my_age = int(me["age"])
-    if is_minor_age(my_age):
-        min_age, max_age = 14, 17
-    elif is_adult_age(my_age):
-        min_age, max_age = 18, 120
-    else:
-        return None
-
-    now = now_ts()
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT p.*
-        FROM profiles p
-        WHERE p.user_id != ?
-          AND p.active = 1
-          AND p.age BETWEEN ? AND ?
-          AND p.user_id NOT IN (
-              SELECT target_id FROM reactions WHERE user_id = ?
-          )
-          AND p.user_id NOT IN (
-              SELECT blocked_id FROM blocks WHERE user_id = ?
-          )
-          AND p.user_id NOT IN (
-              SELECT user_id FROM blocks WHERE blocked_id = ?
-          )
-        ORDER BY
-          CASE WHEN LOWER(p.city) = LOWER(?) THEN 0 ELSE 1 END,
-          CASE WHEN p.boost_until > ? THEN 0 ELSE 1 END,
-          CASE WHEN p.vip_until > ? THEN 0 ELSE 1 END,
-          RANDOM()
-        LIMIT 1
-        """,
-        (user_id, min_age, max_age, user_id, user_id, user_id, me["city"], now, now),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-# =========================
-# YOOMONEY API & PAYMENT LINKS
-# =========================
-def generate_yoomoney_link(order_id: str, total_rub: int, description: str) -> str:
+def create_yoomoney_pay_link(order_id: str, total_rub: int, description: str) -> str:
+    """Генерирует платёжную ссылку ЮMoney (оплата картой любого банка или кошельком)."""
     params = {
         "receiver": YOOMONEY_WALLET,
         "quickpay-form": "button",
         "paymentType": "AC",
         "sum": str(total_rub),
         "label": order_id,
-        "targets": description,
+        "targets": description[:120],
     }
     return f"https://yoomoney.ru/quickpay/confirm?{urlencode(params)}"
 
 
+def is_yoomoney_token_configured() -> bool:
+    """Проверяет, задан ли реальный токен ЮMoney в .env."""
+    if not YOOMONEY_TOKEN:
+        return False
+    placeholders = ("ваш_токен", "your_token", "insert", "placeholder", "токен_юmoney", "xxx")
+    low = YOOMONEY_TOKEN.lower()
+    if any(p in low for p in placeholders) or len(YOOMONEY_TOKEN) < 20:
+        return False
+    return True
+
+
 async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str, bool]:
     """
-    Проверяет оплату по API ЮMoney.
-    Возвращает: (оплачено_ли, сообщение_для_пользователя, нужен_ли_ручной_режим_админа)
+    Проверяет поступление средств через API ЮMoney по метке order_id.
+    Возвращает: (оплачено: bool, текст_сообщения: str, нужна_ручная_проверка_админом: bool)
     """
-    # Если токен не задан или оставлена заглушка из примера
-    if not YOOMONEY_TOKEN or "ваш_" in YOOMONEY_TOKEN.lower() or len(YOOMONEY_TOKEN) < 20:
+    if not is_yoomoney_token_configured():
         return (
             False,
-            "⏳ Платёж проверяется! Если вы ещё не оплатили — нажмите «Оплатить» выше. Если уже перевели — заявка отправлена администратору, услуга активируется в ближайшее время!",
+            "⏳ Заявка на проверку оплаты отправлена! Если вы уже оплатили счёт, ожидайте подтверждения (обычно 1–3 минуты).",
             True,
         )
 
@@ -807,60 +150,645 @@ async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[b
         "Authorization": f"Bearer {YOOMONEY_TOKEN}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
-    data = {
-        "label": order_id,
-        "records": "10",
-    }
+    data = {"label": order_id, "records": "10"}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data, timeout=10) as resp:
+            async with session.post(url, headers=headers, data=data, timeout=12) as resp:
                 if resp.status == 401:
-                    logging.warning("ЮMoney вернул 401 Unauthorized: неверный YOOMONEY_TOKEN в .env. Переключаемся на подтверждение админом.")
+                    logging.warning("YOOMONEY_TOKEN невалиден (HTTP 401). Переключение на ручную проверку админом.")
                     return (
                         False,
-                        "⏳ Заявка на проверку оплаты отправлена! Если вы ещё не оплатили счёт — нажмите кнопку оплаты выше. После перевода услуга будет начислена!",
+                        "⏳ Заявка на проверку отправлена! Если вы ещё не оплатили счёт — нажмите кнопку оплаты выше. После оплаты заказ будет активирован.",
                         True,
                     )
                 if resp.status != 200:
                     return (
                         False,
-                        "⏳ Платёж ещё в обработке. Подождите 15 секунд и нажмите «Проверить оплату» снова.",
+                        "⏳ Платёж в обработке. Если вы уже оплатили, подождите 1–2 минуты.",
                         True,
                     )
                 result = await resp.json()
-                operations = result.get("operations", [])
-                for op in operations:
-                    if (
-                        op.get("status") == "success"
-                        and op.get("direction") == "in"
-                        and str(op.get("label")) == str(order_id)
-                    ):
-                        op_amount = float(op.get("amount", 0))
-                        if op_amount >= expected_total * 0.95:
-                            return True, str(op.get("operation_id", "yoomoney_paid")), False
-                return (
-                    False,
-                    "⏳ Оплата по этому счёту ещё не поступила. Сначала оплатите по кнопке выше, подождите 10–15 секунд и нажмите «Проверить оплату».",
-                    False,
-                )
     except Exception as e:
-        logging.error(f"YooMoney check error: {e}")
-        return (
-            False,
-            "⏳ Проверка платежа... Если вы уже оплатили, заявка передана администратору!",
-            True,
-        )
+        logging.error(f"YooMoney API error: {e}")
+        return False, "⏳ Ожидание ответа от платёжного шлюза. Попробуйте через минуту.", True
+
+    operations = result.get("operations", [])
+    for op in operations:
+        if op.get("status") == "success" and op.get("direction") == "in":
+            amount = float(op.get("amount", 0))
+            if op.get("label") == order_id and amount >= expected_total * 0.95:
+                return True, "✅ Оплата успешно подтверждена! Привилегии активированы.", False
+
+    return (
+        False,
+        "⏳ Оплата ещё не найдена.\n\n1️⃣ Убедитесь, что вы перешли по кнопке «💳 Оплатить» и завершили перевод.\n2️⃣ После оплаты подождите 10–30 секунд и нажмите «🔄 Проверить оплату» снова.",
+        False,
+    )
 
 
 # =========================
-# SINGLE-WINDOW ENGINE (АВТОУДАЛЕНИЕ СООБЩЕНИЙ)
+# БАЗА ДАННЫХ SQLite
 # =========================
-async def safe_delete_message(bot: Bot, chat_id: int, message_id: Optional[int]) -> None:
-    if not message_id:
-        return
+class Database:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    name TEXT NOT NULL,
+                    age INTEGER NOT NULL,
+                    city TEXT NOT NULL,
+                    bio TEXT NOT NULL,
+                    photo_id TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    boost_until INTEGER NOT NULL DEFAULT 0,
+                    vip_until INTEGER NOT NULL DEFAULT 0,
+                    superlikes INTEGER NOT NULL DEFAULT 1,
+                    referred_by INTEGER NOT NULL DEFAULT 0,
+                    ref_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_referrals (
+                    user_id INTEGER PRIMARY KEY,
+                    inviter_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reactions (
+                    user_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, target_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS matches (
+                    user1 INTEGER NOT NULL,
+                    user2 INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (user1, user2)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blocks (
+                    user_id INTEGER NOT NULL,
+                    blocked_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, blocked_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reporter_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    product TEXT NOT NULL,
+                    base_amount INTEGER NOT NULL DEFAULT 0,
+                    commission INTEGER NOT NULL DEFAULT 0,
+                    amount INTEGER NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    telegram_charge_id TEXT,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    rating INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.commit()
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        p_cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
+        if "vip_until" not in p_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN vip_until INTEGER NOT NULL DEFAULT 0")
+        if "superlikes" not in p_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN superlikes INTEGER NOT NULL DEFAULT 1")
+        if "referred_by" not in p_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN referred_by INTEGER NOT NULL DEFAULT 0")
+        if "ref_count" not in p_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0")
+
+        o_cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        if "base_amount" not in o_cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN base_amount INTEGER NOT NULL DEFAULT 0")
+        if "commission" not in o_cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN commission INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+    def get_profile(self, user_id: int) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
+
+    def set_pending_referral(self, user_id: int, inviter_id: int) -> None:
+        if user_id == inviter_id or inviter_id <= 0:
+            return
+        if self.get_profile(user_id):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_referrals (user_id, inviter_id, created_at) VALUES (?, ?, ?)",
+                (user_id, inviter_id, int(time.time())),
+            )
+            conn.commit()
+
+    def pop_pending_referral(self, user_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT inviter_id FROM pending_referrals WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row:
+                conn.execute("DELETE FROM pending_referrals WHERE user_id = ?", (user_id,))
+                conn.commit()
+                return int(row["inviter_id"])
+            return 0
+
+    def reward_referral_signup(self, inviter_id: int, new_user_id: int) -> Tuple[int, bool]:
+        now = int(time.time())
+        with self._connect() as conn:
+            inviter = conn.execute("SELECT * FROM profiles WHERE user_id = ?", (inviter_id,)).fetchone()
+            if not inviter:
+                return 0, False
+
+            conn.execute(
+                "UPDATE profiles SET referred_by = ?, superlikes = superlikes + 1 WHERE user_id = ?",
+                (inviter_id, new_user_id),
+            )
+
+            new_ref_count = int(inviter["ref_count"]) + 1
+            cur_boost = max(int(inviter["boost_until"]), now)
+            new_boost = cur_boost + 6 * 3600
+
+            got_milestone_vip = (new_ref_count % 3 == 0)
+            cur_vip = max(int(inviter["vip_until"]), now)
+            new_vip = cur_vip + (86400 if got_milestone_vip else 0)
+            added_super = 2 if got_milestone_vip else 1
+
+            conn.execute(
+                """
+                UPDATE profiles
+                SET ref_count = ?, boost_until = ?, vip_until = ?, superlikes = superlikes + ?
+                WHERE user_id = ?
+                """,
+                (new_ref_count, new_boost, new_vip, added_super, inviter_id),
+            )
+            conn.commit()
+            return new_ref_count, got_milestone_vip
+
+    def reward_inviter_on_purchase(self, buyer_id: int) -> Optional[int]:
+        p = self.get_profile(buyer_id)
+        if not p or int(p["referred_by"]) <= 0:
+            return None
+        inviter_id = int(p["referred_by"])
+        inviter = self.get_profile(inviter_id)
+        if not inviter:
+            return None
+        now = int(time.time())
+        cur_vip = max(int(inviter["vip_until"]), now)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE profiles SET vip_until = ?, superlikes = superlikes + 2 WHERE user_id = ?",
+                (cur_vip + 86400, inviter_id),
+            )
+            conn.commit()
+        return inviter_id
+
+    def get_top_referrers(self, limit: int = 10) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT name, age, city, ref_count, vip_until FROM profiles WHERE ref_count > 0 ORDER BY ref_count DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def upsert_profile(
+        self,
+        user_id: int,
+        username: Optional[str],
+        name: str,
+        age: int,
+        city: str,
+        bio: str,
+        photo_id: Optional[str],
+    ) -> bool:
+        now = int(time.time())
+        existing = self.get_profile(user_id)
+        with self._connect() as conn:
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE profiles
+                    SET username = ?, name = ?, age = ?, city = ?, bio = ?, photo_id = ?, active = 1
+                    WHERE user_id = ?
+                    """,
+                    (username, name, age, city, bio, photo_id, user_id),
+                )
+                conn.commit()
+                return False
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO profiles (
+                        user_id, username, name, age, city, bio, photo_id,
+                        active, boost_until, vip_until, superlikes, referred_by, ref_count, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 1, 0, 0, ?)
+                    """,
+                    (user_id, username, name, age, city, bio, photo_id, now),
+                )
+                conn.commit()
+                return True
+
+    def set_active(self, user_id: int, active: bool) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE profiles SET active = ? WHERE user_id = ?", (1 if active else 0, user_id))
+            conn.commit()
+
+    def is_vip(self, user_id: int) -> bool:
+        p = self.get_profile(user_id)
+        return bool(p and int(p["vip_until"]) > int(time.time()))
+
+    def add_boost(self, user_id: int, hours: int) -> int:
+        now = int(time.time())
+        p = self.get_profile(user_id)
+        current_until = int(p["boost_until"]) if p else 0
+        new_until = max(now, current_until) + hours * 3600
+        with self._connect() as conn:
+            conn.execute("UPDATE profiles SET boost_until = ? WHERE user_id = ?", (new_until, user_id))
+            conn.commit()
+        return new_until
+
+    def add_vip(self, user_id: int, days: int, bonus_superlikes: int = 0) -> int:
+        now = int(time.time())
+        p = self.get_profile(user_id)
+        current_until = int(p["vip_until"]) if p else 0
+        new_until = max(now, current_until) + days * 86400
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE profiles SET vip_until = ?, superlikes = superlikes + ? WHERE user_id = ?",
+                (new_until, bonus_superlikes, user_id),
+            )
+            conn.commit()
+        return new_until
+
+    def add_superlikes(self, user_id: int, count: int) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE profiles SET superlikes = superlikes + ? WHERE user_id = ?", (count, user_id))
+            conn.commit()
+
+    def use_superlike(self, user_id: int) -> bool:
+        p = self.get_profile(user_id)
+        if not p or int(p["superlikes"]) <= 0:
+            return False
+        with self._connect() as conn:
+            conn.execute("UPDATE profiles SET superlikes = superlikes - 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+        return True
+
+    def reset_user_skips(self, user_id: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM reactions WHERE user_id = ? AND action = 'skip'", (user_id,))
+            conn.commit()
+            return cur.rowcount
+
+    def count_today_likes(self, user_id: int) -> int:
+        since = int(time.time()) - 86400
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM reactions WHERE user_id = ? AND action = 'like' AND created_at >= ?",
+                (user_id, since),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
+    def record_reaction(self, user_id: int, target_id: int, action: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO reactions (user_id, target_id, action, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, target_id, action, int(time.time())),
+            )
+            conn.commit()
+
+    def has_liked(self, user_id: int, target_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM reactions WHERE user_id = ? AND target_id = ? AND action = 'like'",
+                (user_id, target_id),
+            ).fetchone()
+            return row is not None
+
+    def create_match(self, a: int, b: int) -> None:
+        u1, u2 = (a, b) if a < b else (b, a)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO matches (user1, user2, created_at) VALUES (?, ?, ?)",
+                (u1, u2, int(time.time())),
+            )
+            conn.commit()
+
+    def list_matches(self, user_id: int, limit: int = 20) -> List[sqlite3.Row]:
+        me = self.get_profile(user_id)
+        if not me:
+            return []
+        my_age = int(me["age"])
+        min_age, max_age = (14, 17) if my_age < 18 else (18, 100)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    CASE WHEN user1 = ? THEN user2 ELSE user1 END AS other_id,
+                    created_at
+                FROM matches
+                WHERE user1 = ? OR user2 = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, user_id, user_id, limit),
+            ).fetchall()
+
+            result: List[sqlite3.Row] = []
+            for r in rows:
+                p = self.get_profile(int(r["other_id"]))
+                if p and int(p["active"]) == 1 and min_age <= int(p["age"]) <= max_age:
+                    result.append(p)
+            return result
+
+    def get_who_liked_me(self, user_id: int) -> List[sqlite3.Row]:
+        me = self.get_profile(user_id)
+        if not me:
+            return []
+        my_age = int(me["age"])
+        min_age, max_age = (14, 17) if my_age < 18 else (18, 100)
+
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT p.* FROM profiles p
+                JOIN reactions r ON p.user_id = r.user_id
+                WHERE r.target_id = ? AND r.action = 'like'
+                  AND p.active = 1
+                  AND p.age BETWEEN ? AND ?
+                  AND p.user_id NOT IN (SELECT target_id FROM reactions WHERE user_id = ?)
+                  AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)
+                ORDER BY r.created_at DESC
+                """,
+                (user_id, min_age, max_age, user_id, user_id),
+            ).fetchall()
+
+    def block_user(self, user_id: int, blocked_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO blocks (user_id, blocked_id, created_at) VALUES (?, ?, ?)",
+                (user_id, blocked_id, int(time.time())),
+            )
+            conn.commit()
+
+    def report_user(self, reporter_id: int, target_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO reports (reporter_id, target_id, created_at) VALUES (?, ?, ?)",
+                (reporter_id, target_id, int(time.time())),
+            )
+            conn.commit()
+
+    def find_candidate(self, user_id: int, city_prioritized: bool = True) -> Optional[sqlite3.Row]:
+        me = self.get_profile(user_id)
+        if not me:
+            return None
+
+        now = int(time.time())
+        my_city = str(me["city"]).strip().lower()
+        my_age = int(me["age"])
+        min_age, max_age = (14, 17) if my_age < 18 else (18, 100)
+
+        with self._connect() as conn:
+            base_query = """
+                SELECT *
+                FROM profiles p
+                WHERE p.user_id != ?
+                  AND p.active = 1
+                  AND p.age BETWEEN ? AND ?
+                  AND p.user_id NOT IN (SELECT target_id FROM reactions WHERE user_id = ?)
+                  AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)
+                  AND p.user_id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?)
+            """
+            params: List[object] = [user_id, min_age, max_age, user_id, user_id, user_id]
+
+            if city_prioritized:
+                q1 = (
+                    base_query
+                    + """
+                    AND LOWER(TRIM(p.city)) = ?
+                    ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
+                             (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
+                             p.boost_until DESC,
+                             RANDOM()
+                    LIMIT 1
+                    """
+                )
+                row = conn.execute(q1, (*params, my_city, now, now)).fetchone()
+                if row:
+                    return row
+
+            q2 = (
+                base_query
+                + """
+                ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
+                         (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
+                         p.boost_until DESC,
+                         RANDOM()
+                LIMIT 1
+                """
+            )
+            return conn.execute(q2, (*params, now, now)).fetchone()
+
+    def create_order(
+        self, order_id: str, user_id: int, product: str, base_amount: int, commission: int, total_amount: int
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO orders (
+                    order_id, user_id, product, base_amount, commission, amount, currency, status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'RUB', 'created', ?)
+                """,
+                (order_id, user_id, product, base_amount, commission, total_amount, int(time.time())),
+            )
+            conn.commit()
+
+    def get_order(self, order_id: str) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+
+    def mark_order_paid(self, order_id: str, charge_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE orders SET status = 'paid', telegram_charge_id = ? WHERE order_id = ?",
+                (charge_id, order_id),
+            )
+            conn.commit()
+
+    # --- МЕТОДЫ ОТЗЫВОВ ---
+    def add_or_update_review(self, user_id: int, author_name: str, rating: int, text: str) -> Tuple[int, bool]:
+        """Сохраняет или обновляет отзыв пользователя. Возвращает (review_id, это_первый_отзыв)."""
+        now = int(time.time())
+        with self._connect() as conn:
+            existing = conn.execute("SELECT id FROM reviews WHERE user_id = ?", (user_id,)).fetchone()
+            if existing:
+                rev_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE reviews SET author_name = ?, rating = ?, text = ?, created_at = ? WHERE id = ?",
+                    (author_name, rating, text, now, rev_id),
+                )
+                conn.commit()
+                return rev_id, False
+            else:
+                cur = conn.execute(
+                    "INSERT INTO reviews (user_id, author_name, rating, text, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, author_name, rating, text, now),
+                )
+                conn.commit()
+                return int(cur.lastrowid or 0), True
+
+    def get_reviews_stats(self) -> Tuple[int, float]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) as cnt, COALESCE(AVG(rating), 0) as avg_r FROM reviews").fetchone()
+            return int(row["cnt"]), round(float(row["avg_r"]), 1)
+
+    def list_reviews(self, limit: int = 5, offset: int = 0) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM reviews ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+
+    def delete_review(self, review_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_admin_stats(self) -> Dict[str, int]:
+        now = int(time.time())
+        with self._connect() as conn:
+            total_users = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+            vip_users = conn.execute("SELECT COUNT(*) FROM profiles WHERE vip_until > ?", (now,)).fetchone()[0]
+            total_refs = conn.execute("SELECT COUNT(*) FROM profiles WHERE referred_by > 0").fetchone()[0]
+            paid_orders = conn.execute("SELECT COUNT(*) FROM orders WHERE status = 'paid'").fetchone()[0]
+            total_rev = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid'"
+            ).fetchone()[0]
+            total_comm = conn.execute(
+                "SELECT COALESCE(SUM(commission), 0) FROM orders WHERE status = 'paid'"
+            ).fetchone()[0]
+            total_reviews = conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+            return {
+                "users": total_users,
+                "vips": vip_users,
+                "refs": total_refs,
+                "orders": paid_orders,
+                "revenue": total_rev,
+                "commission": total_comm,
+                "reviews": total_reviews,
+            }
+
+    def get_all_user_ids(self) -> List[int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT user_id FROM profiles").fetchall()
+            return [int(r["user_id"]) for r in rows]
+
+
+# =========================
+# СОСТОЯНИЯ (FSM)
+# =========================
+class ProfileForm(StatesGroup):
+    name = State()
+    age = State()
+    city = State()
+    bio = State()
+    photo = State()
+
+
+class SuperMsgForm(StatesGroup):
+    waiting_text = State()
+
+
+class SupportForm(StatesGroup):
+    waiting_text = State()
+
+
+class ReviewForm(StatesGroup):
+    waiting_rating = State()
+    waiting_text = State()
+
+
+class AdminForm(StatesGroup):
+    waiting_broadcast = State()
+    waiting_gift_uid = State()
+
+
+# =========================
+# АВТО-ОЧИСТКА СООБЩЕНИЙ
+# =========================
+async def clear_previous_bot_messages(bot: Bot, user_id: int) -> None:
+    msg_ids = last_bot_messages.get(user_id, [])
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=mid)
+        except Exception:
+            pass
+    last_bot_messages[user_id] = []
+
+
+async def delete_user_msg(message: Message) -> None:
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await message.delete()
     except Exception:
         pass
 
@@ -872,1097 +800,1061 @@ async def send_screen(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     photo_id: Optional[str] = None,
 ) -> Message:
-    prev_msg_id = last_bot_messages.get(user_id)
-    if prev_msg_id:
-        await safe_delete_message(bot, user_id, prev_msg_id)
-
-    try:
-        if photo_id:
-            msg = await bot.send_photo(
-                chat_id=user_id,
-                photo=photo_id,
-                caption=text,
-                reply_markup=reply_markup,
-            )
-        else:
-            msg = await bot.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-    except Exception:
+    await clear_previous_bot_messages(bot, user_id)
+    if photo_id:
+        msg = await bot.send_photo(
+            chat_id=user_id,
+            photo=photo_id,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    else:
         msg = await bot.send_message(
             chat_id=user_id,
             text=text,
             reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
-
-    last_bot_messages[user_id] = msg.message_id
+    last_bot_messages[user_id] = [msg.message_id]
     return msg
 
 
 # =========================
-# UI FORMATTING & KEYBOARDS
+# КЛАВИАТУРЫ И ДИЗАЙН
 # =========================
-def format_profile_card(row: sqlite3.Row, title: Optional[str] = None, show_status: bool = False) -> str:
-    name = html.escape(str(row["name"]))
-    age = int(row["age"])
-    city = html.escape(str(row["city"]))
-    bio = html.escape(str(row["bio"]))
-
-    badges = []
-    if is_vip(row):
-        badges.append("👑 <b>VIP</b>")
-    if is_boosted(row):
-        badges.append("⚡️ <b>TOP</b>")
-    badge_str = (" · " + " ".join(badges)) if badges else ""
-
-    lines = []
-    if title:
-        lines.append(f"<b>{title}</b>\n")
-
-    lines.append(f"👤 <b>{name}, {age}</b>  📍 <i>{city}</i>{badge_str}")
-    lines.append(f"<blockquote>{bio}</blockquote>")
-
-    if show_status:
-        active_str = "🟢 Видна в поиске" if int(row["active"]) == 1 else "🔴 Скрыта из поиска"
-        group_str = "🔞 Взрослая лига (18+)" if is_adult_age(age) else "🌱 Молодежная лига (14–17)"
-        lines.append(f"\n📊 <b>Статус:</b> {active_str}")
-        lines.append(f"🛡 <b>Категория:</b> {group_str}")
-        lines.append(f"💌 <b>Супер-писем:</b> {int(row['superlikes'])} шт.")
-        lines.append(f"👥 <b>Приглашено друзей:</b> {int(row['ref_count'])} чел.")
-
-        if is_vip(row):
-            hours_left = max(1, (int(row["vip_until"]) - now_ts()) // 3600)
-            lines.append(f"👑 <b>VIP активен:</b> ещё ~{hours_left} ч.")
-        if is_boosted(row):
-            mins_left = max(1, (int(row["boost_until"]) - now_ts()) // 60)
-            lines.append(f"🚀 <b>ТОП-буст:</b> ещё {mins_left} мин.")
-
-    return "\n".join(lines)
-
-
-def vpn_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=VELVET_VPN_TEXT, url=VELVET_VPN_URL)
-
-
-def start_no_profile_kb() -> InlineKeyboardMarkup:
+def kb_start_no_profile() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✨ Создать анкету", callback_data="profile:create")],
-            [vpn_button()],
+            [InlineKeyboardButton(text="✨ Создать яркую анкету", callback_data="profile:create")],
+            [
+                InlineKeyboardButton(text="⭐️ Отзывы о боте", callback_data="reviews:menu"),
+                InlineKeyboardButton(text="🛠 Нашли ошибку? Поддержка", url=SUPPORT_URL),
+            ],
+            [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
         ]
     )
 
 
-def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    me = get_profile(user_id)
-    incoming_cnt = len(get_incoming_likes(user_id)) if me else 0
-    likes_label = f"👀 Кто лайкнул ({incoming_cnt})" if incoming_cnt > 0 else "👀 Кто меня лайкнул"
+def kb_main_menu(db: Database, user_id: int) -> InlineKeyboardMarkup:
+    p = db.get_profile(user_id)
+    is_adult = bool(p and int(p["age"]) >= 18)
+    liked_me_count = len(db.get_who_liked_me(user_id)) if p else 0
+    liked_btn_text = f"👀 Кто меня лайкнул ({liked_me_count})" if liked_me_count > 0 else "👀 Кто меня лайкнул"
 
-    rows = [
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+        [InlineKeyboardButton(text=liked_btn_text, callback_data="likes:list")],
         [
-            InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="menu:browse"),
-            InlineKeyboardButton(text=likes_label, callback_data="menu:who_liked"),
+            InlineKeyboardButton(text="💌 Мои мэтчи", callback_data="matches:list"),
+            InlineKeyboardButton(text="👤 Моя анкета", callback_data="profile:me"),
         ],
-        [
-            InlineKeyboardButton(text="💞 Взаимные симпатии", callback_data="menu:matches"),
-            InlineKeyboardButton(text="🎁 Бесплатный VIP (Рефералка)", callback_data="menu:referral"),
-        ],
+        [InlineKeyboardButton(text="🎁 Бесплатный VIP (Рефералка)", callback_data="ref:menu")],
     ]
-
-    if me and is_adult_age(int(me["age"])) and PAYMENTS_ENABLED:
-        rows.append(
-            [
-                InlineKeyboardButton(text="👑 VIP и Премиум-магазин", callback_data="menu:shop"),
-                InlineKeyboardButton(text="🚀 Поднять в ТОП", callback_data="shop:item:boost_24"),
-            ]
-        )
+    if is_adult and PAYMENTS_ENABLED:
+        rows.append([InlineKeyboardButton(text="👑 Магазин привилегий и VIP", callback_data="shop:menu")])
 
     rows.append(
         [
-            InlineKeyboardButton(text="👤 Моя анкета", callback_data="menu:me"),
-            InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings"),
+            InlineKeyboardButton(text="⭐️ Отзывы", callback_data="reviews:menu"),
+            InlineKeyboardButton(text="🛠 Нашли ошибку? Поддержка", url=SUPPORT_URL),
         ]
     )
-    rows.append([vpn_button()])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings:open"),
+            InlineKeyboardButton(text="🆘 Помощь", callback_data="support:menu"),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)])
+
+    if user_id == ADMIN_ID:
+        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin:menu")])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def referral_kb(user_id: int) -> InlineKeyboardMarkup:
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
-    share_text = (
-        "💘 Зацени крутого бота для знакомств Лавчик! "
-        "Заходи по моей ссылке и получи +2 Супер-письма в подарок 🎁"
-    )
-    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+def kb_form_nav(back_step: Optional[str] = None, allow_skip_photo: bool = False) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if allow_skip_photo:
+        rows.append([InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="form:skip_photo")])
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Поделиться ссылкой с друзьями", url=share_url)],
-            [InlineKeyboardButton(text="🏆 ТОП-10 приглашающих", callback_data="ref:leaderboard")],
-            [vpn_button()],
-            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
-        ]
-    )
-
-
-def reg_nav_kb(can_back: bool = True, skip_photo: bool = False) -> InlineKeyboardMarkup:
-    rows = []
-    if skip_photo:
-        rows.append([InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="reg:skip_photo")])
-
-    nav_row = []
-    if can_back:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back"))
-    nav_row.append(InlineKeyboardButton(text="❌ Отмена", callback_data="reg:cancel"))
+    nav_row: List[InlineKeyboardButton] = []
+    if back_step:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"form:back:{back_step}"))
+    nav_row.append(InlineKeyboardButton(text="❌ Отмена", callback_data="form:cancel"))
     rows.append(nav_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def candidate_kb(target_id: int, viewer_age: int) -> InlineKeyboardMarkup:
-    rows = [
+def kb_candidate(target_id: int, show_supermsg: bool = True) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton(text="❤️ Лайк", callback_data=f"act:like:{target_id}"),
-            InlineKeyboardButton(text="👎 Дальше", callback_data=f"act:skip:{target_id}"),
-        ],
+            InlineKeyboardButton(text="❤️ Нравится", callback_data=f"react:like:{target_id}"),
+            InlineKeyboardButton(text="👎 Дальше", callback_data=f"react:skip:{target_id}"),
+        ]
     ]
-    if is_adult_age(viewer_age):
-        rows.append(
-            [InlineKeyboardButton(text="💌 Написать сразу (Супер-письмо)", callback_data=f"act:super:{target_id}")]
-        )
+    if show_supermsg:
+        rows.append([InlineKeyboardButton(text="💌 Написать сразу (Супер-письмо)", callback_data=f"super:ask:{target_id}")])
+    rows.append([InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)])
     rows.append(
         [
-            InlineKeyboardButton(text="⚠️ Жалоба", callback_data=f"act:report:{target_id}"),
-            InlineKeyboardButton(text="🚫 В ЧС", callback_data=f"act:block:{target_id}"),
+            InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"safety:report:{target_id}"),
+            InlineKeyboardButton(text="🚫 В ЧС", callback_data=f"safety:block:{target_id}"),
         ]
     )
-    rows.append([vpn_button()])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def who_liked_kb(target_id: int, viewer_is_vip: bool) -> InlineKeyboardMarkup:
-    if viewer_is_vip:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="❤️ Ответить взаимностью", callback_data=f"act:like:{target_id}"),
-                    InlineKeyboardButton(text="👎 Скрыть", callback_data=f"act:skip:{target_id}"),
-                ],
-                [vpn_button()],
-                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
-            ]
-        )
-    else:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="👑 Открыть анкету (Подключить VIP)", callback_data="shop:item:vip_7")],
-                [InlineKeyboardButton(text="🎁 Получить VIP за друзей", callback_data="menu:referral")],
-                [vpn_button()],
-                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
-            ]
-        )
-
-
-def settings_kb(user_id: int) -> InlineKeyboardMarkup:
-    me = get_profile(user_id)
-    active = int(me["active"]) == 1 if me else True
-    toggle_text = "🙈 Скрыть мою анкету" if active else "👁 Показать анкету в поиске"
-
-    rows = [
+    rows.append(
         [
-            InlineKeyboardButton(text="✏️ Изменить анкету", callback_data="profile:create"),
-            InlineKeyboardButton(text=toggle_text, callback_data="settings:toggle"),
-        ],
-        [InlineKeyboardButton(text="🗑 Удалить анкету навсегда", callback_data="settings:delete")],
-        [vpn_button()],
-        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
-    ]
+            InlineKeyboardButton(text="🛠 Нашли ошибку?", url=SUPPORT_URL),
+            InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:home"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def shop_menu_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for code, prod in PRODUCTS.items():
+def kb_shop_menu() -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for key, prod in PRODUCTS.items():
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{prod.title} — {total} ₽",
-                    callback_data=f"shop:item:{code}",
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton(text="🎁 Получить VIP бесплатно за друзей", callback_data="menu:referral")])
-    rows.append([vpn_button()])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
+        rows.append([InlineKeyboardButton(text=f"{prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+    rows.append([InlineKeyboardButton(text="🎁 Получить VIP бесплатно ( за друзей )", callback_data="ref:menu")])
+    rows.append([InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)])
+    rows.append(
+        [
+            InlineKeyboardButton(text="🛠 Помощь по оплате", url=SUPPORT_URL),
+            InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def payment_invoice_kb(order_id: str, pay_url: str, product_code: str) -> InlineKeyboardMarkup:
+def kb_settings(active: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⏸ Скрыть мою анкету из поиска" if active else "▶️ Включить показ анкеты"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить через ЮMoney / Картой", url=pay_url)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"pay:check:{order_id}")],
+            [InlineKeyboardButton(text="✏️ Заполнить анкету заново", callback_data="profile:create")],
+            [InlineKeyboardButton(text=toggle_text, callback_data="settings:toggle_active")],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:shop"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
+                InlineKeyboardButton(text="⭐️ Отзывы о боте", callback_data="reviews:menu"),
+                InlineKeyboardButton(text="🛠 Сообщить об ошибке", url=SUPPORT_URL),
             ],
+            [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+            [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
         ]
     )
 
 
-def back_home_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [vpn_button()],
-            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
-        ]
+def format_profile_card(p: sqlite3.Row, title: str = "Анкета участника") -> str:
+    now = int(time.time())
+    badges: List[str] = []
+    if int(p["vip_until"]) > now:
+        badges.append("👑 VIP")
+    if int(p["boost_until"]) > now:
+        badges.append("⚡️ TOP")
+    badge_str = f" [{' | '.join(badges)}]" if badges else ""
+
+    return (
+        f"💘 <b>{title}</b>{badge_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Имя:</b> {p['name']}, {p['age']} лет\n"
+        f"📍 <b>Город:</b> {p['city']}\n\n"
+        f"💬 <b>О себе:</b>\n"
+        f"<blockquote>{p['bio']}</blockquote>"
     )
 
 
 # =========================
-# FSM STATES
+# РОУТЕР И ОБРАБОТЧИКИ
 # =========================
-class RegStates(StatesGroup):
-    name = State()
-    age = State()
-    city = State()
-    bio = State()
-    photo = State()
+router = Router()
 
 
-class SuperMsgState(StatesGroup):
-    waiting_text = State()
-
-
-class SupportState(StatesGroup):
-    waiting_text = State()
-
-
-class AdminBroadcastState(StatesGroup):
-    waiting_post = State()
-
-
-class AdminGiftState(StatesGroup):
-    waiting_user_id = State()
-
-
-# =========================
-# SCREEN RENDERERS
-# =========================
-async def render_home(bot: Bot, user_id: int, notice: Optional[str] = None) -> None:
-    me = get_profile(user_id)
-    if not me:
+async def render_home(bot: Bot, db: Database, user_id: int) -> None:
+    p = db.get_profile(user_id)
+    if not p:
         text = (
-            "💘 <b>Добро пожаловать в бот знакомств «Лавчик»!</b>\n\n"
-            "Здесь ты быстро найдешь новых друзей, общение или вторую половинку в своем городе.\n\n"
-            "🔒 <i>Строгое разделение по возрасту, умный подбор анкет и полная приватность.</i>\n\n"
-            "Нажми кнопку ниже, чтобы создать анкету за 1 минуту 👇"
+            "💘 <b>Добро пожаловать в сервис знакомств Лавчик!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Здесь ты легко найдёшь новых друзей, яркое общение или свою вторую половинку в своём городе.\n\n"
+            "✨ Умный подбор анкет по возрасту и интересам\n"
+            "💌 Мгновенные уведомления о симпатиях\n"
+            "🎁 Щедрая реферальная программа с бесплатным VIP\n"
+            "🔒 Полная безопасность и приватность\n\n"
+            "👇 <b>Нажми кнопку ниже, чтобы создать анкету за 30 секунд:</b>"
         )
-        if notice:
-            text = f"{notice}\n\n{text}"
-        await send_screen(bot, user_id, text, reply_markup=start_no_profile_kb())
+        await send_screen(bot, user_id, text, reply_markup=kb_start_no_profile())
         return
 
-    header = "🏠 <b>Главное меню</b>"
-    if notice:
-        header = f"{notice}\n\n{header}"
+    now = int(time.time())
+    vip_active = int(p["vip_until"]) > now
+    boost_active = int(p["boost_until"]) > now
+    active_status = "🟢 Активна в поиске" if int(p["active"]) == 1 else "⏸ Скрыта из поиска"
 
-    card = format_profile_card(me, title=header, show_status=True)
+    vip_line = (
+        f"👑 <b>VIP-статус:</b> Активен (ещё {max(1, (int(p['vip_until']) - now) // 3600)} ч.)\n"
+        if vip_active
+        else "👑 <b>VIP-статус:</b> Не подключён\n"
+    )
+    boost_line = (
+        f"🚀 <b>ТОП-продвижение:</b> Активно\n"
+        if boost_active
+        else ""
+    )
+
+    text = (
+        f"{format_profile_card(p, title='Главное меню')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 <b>Статус:</b> {active_status}\n"
+        f"{vip_line}"
+        f"{boost_line}"
+        f"💌 <b>Супер-писем:</b> {p['superlikes']} шт.\n"
+        f"👥 <b>Приглашено друзей:</b> {p['ref_count']} чел."
+    )
     await send_screen(
         bot,
         user_id,
-        card,
-        reply_markup=main_menu_kb(user_id),
-        photo_id=me["photo_id"],
+        text,
+        reply_markup=kb_main_menu(db, user_id),
+        photo_id=p["photo_id"] if p["photo_id"] else None,
     )
 
 
-async def render_referral_screen(bot: Bot, user_id: int) -> None:
-    me = get_profile(user_id)
-    if not me:
-        await render_home(bot, user_id)
+@router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await state.clear()
+    uid = message.from_user.id
+
+    args = (command.args or "").strip()
+    if args.startswith("ref_"):
+        try:
+            inviter_id = int(args.replace("ref_", ""))
+            db.set_pending_referral(uid, inviter_id)
+        except ValueError:
+            pass
+
+    await render_home(bot, db, uid)
+
+
+@router.callback_query(F.data == "menu:home")
+async def cb_menu_home(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    await state.clear()
+    await call.answer()
+    await render_home(bot, db, call.from_user.id)
+
+
+# =========================
+# РЕФЕРАЛЬНАЯ СИСТЕМА
+# =========================
+@router.callback_query(F.data == "ref:menu")
+async def cb_ref_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer("Сначала создай анкету!", show_alert=True)
         return
 
-    ref_cnt = int(me["ref_count"])
-    step_in_cycle = ref_cnt % 3
-    progress_bar = "🟩" * step_in_cycle + "⬜️" * (3 - step_in_cycle)
-    left_for_vip = 3 - step_in_cycle
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    await call.answer()
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{uid}"
+    share_text = "💘 Зацени крутой бот для знакомств Лавчик! Нашёл тут много интересных людей из нашего города 🔥"
+    share_url = f"https://t.me/share/url?{urlencode({'url': ref_link, 'text': share_text})}"
+
+    ref_count = int(p["ref_count"])
+    progress = ref_count % 3
+    bar = "🟩" * progress + "⬜️" * (3 - progress)
+    left_for_vip = 3 - progress
 
     text = (
-        "🎁 <b>Партнёрская программа и Бесплатный VIP</b>\n\n"
-        "Приглашай друзей по своей личной ссылке и получай жирные бонусы за каждого, кто создаст анкету!\n\n"
-        "💎 <b>Твои награды:</b>\n"
-        "• <b>За каждого друга:</b> +1 Супер-письмо 💌 и +6 часов ТОП-буста 🚀\n"
-        "• <b>За каждых 3 друзей:</b> 👑 <b>VIP-статус на 24 часа</b> автоматически!\n"
-        "• <b>Бонус с покупок:</b> если твой друг купит любую услугу в магазине, ты получишь ещё <b>+24ч VIP и +2 Супер-письма</b>!\n"
-        "• <b>Другу-новичку:</b> +2 Супер-письма на старте вместо 1!\n\n"
-        f"📊 <b>Твоя статистика:</b>\n"
-        f"👥 Приглашено друзей (с анкетой): <b>{ref_cnt} чел.</b>\n"
-        f"👑 Прогресс до следующего VIP: {progress_bar} (осталось: <b>{left_for_vip}</b>)\n\n"
-        f"🔗 <b>Твоя реферальная ссылка (нажми, чтобы скопировать):</b>\n"
+        "🎁 <b>Партнёрская программа «Лавчик»</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Приглашай друзей по своей личной ссылке и получай платные привилегии <b>абсолютно бесплатно</b>!\n\n"
+        "💎 <b>Что получит твой друг:</b>\n"
+        "• <b>2 💌 Супер-письма</b> сразу при создании анкеты (вместо 1)!\n\n"
+        "🔥 <b>Твои награды за каждого друга:</b>\n"
+        "1️⃣ <b>За регистрацию анкеты другом:</b>\n"
+        "   ➕ <b>1 💌 Супер-письмо</b> + <b>6 часов 🚀 ТОП-продвижения</b>\n"
+        "2️⃣ <b>За каждых 3-х приглашённых друзей:</b>\n"
+        "   ➕ <b>👑 VIP-статус на 24 часа</b> + бонусное Супер-письмо!\n"
+        "3️⃣ <b>Если друг купит любую услугу в магазине:</b>\n"
+        "   ➕ Тебе начисляется <b>👑 +24 часа VIP</b> и <b>+2 💌 Супер-письма</b>!\n\n"
+        "📊 <b>Твоя статистика:</b>\n"
+        f"👥 Приглашено друзей: <b>{ref_count} чел.</b>\n"
+        f"👑 До следующего VIP: [{bar}] (осталось <b>{left_for_vip}</b> др.)\n\n"
+        "🔗 <b>Твоя личная ссылка (нажми, чтобы скопировать):</b>\n"
         f"<code>{ref_link}</code>"
     )
-    await send_screen(bot, user_id, text, reply_markup=referral_kb(user_id))
 
-
-async def render_next_candidate(bot: Bot, user_id: int, prefix_notice: Optional[str] = None) -> None:
-    me = get_profile(user_id)
-    if not me:
-        await render_home(bot, user_id)
-        return
-
-    if int(me["active"]) == 0:
-        await render_home(
-            bot,
-            user_id,
-            notice="⚠️ <b>Твоя анкета сейчас скрыта!</b>\nВключи её в «Настройках», чтобы смотреть других людей.",
-        )
-        return
-
-    cand = get_next_candidate(user_id)
-    if not cand:
-        text = ""
-        if prefix_notice:
-            text += f"{prefix_notice}\n\n"
-        text += (
-            "🔍 <b>Новые анкеты в твоей категории пока закончились!</b>\n\n"
-            "Новые пользователи регистрируются каждый час.\n"
-            "💡 <i>Хочешь просмотреть заново тех, кого случайно пропустил(а)? Используй «🔄 Сброс пропущенных анкет» или позови друзей по рефералке!</i>"
-        )
-        kb_rows = []
-        if is_adult_age(int(me["age"])) and PAYMENTS_ENABLED:
-            kb_rows.append(
-                [InlineKeyboardButton(text="🔄 Сбросить пропущенные анкеты", callback_data="shop:item:reset_skips")]
-            )
-            kb_rows.append(
-                [InlineKeyboardButton(text="🚀 Поднять мою анкету в ТОП", callback_data="shop:item:boost_24")]
-            )
-        kb_rows.append([InlineKeyboardButton(text="🎁 Пригласить друзей (+VIP)", callback_data="menu:referral")])
-        kb_rows.append([vpn_button()])
-        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
-        await send_screen(bot, user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        return
-
-    title = "🔥 <b>Подходящая анкета</b>"
-    if prefix_notice:
-        title = f"{prefix_notice}\n\n{title}"
-
-    caption = format_profile_card(cand, title=title)
-    kb = candidate_kb(int(cand["user_id"]), int(me["age"]))
-    await send_screen(bot, user_id, caption, reply_markup=kb, photo_id=cand["photo_id"])
-
-
-async def render_reg_step(bot: Bot, user_id: int, step: str, error_msg: Optional[str] = None) -> None:
-    prefix = f"⚠️ <b>{error_msg}</b>\n\n" if error_msg else ""
-
-    if step == "name":
-        text = (
-            f"{prefix}📝 <b>Шаг 1 из 5 — Как тебя зовут?</b>\n\n"
-            "Напиши своё имя (от 2 до 30 символов):"
-        )
-        await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=False))
-    elif step == "age":
-        text = (
-            f"{prefix}🎂 <b>Шаг 2 из 5 — Сколько тебе лет?</b>\n\n"
-            "Отправь возраст цифрами (от <b>14</b> до <b>80</b>):"
-        )
-        await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=True))
-    elif step == "city":
-        text = (
-            f"{prefix}🏙 <b>Шаг 3 из 5 — Из какого ты города?</b>\n\n"
-            "Анкеты из твоего города будут показываться тебе в первую очередь:"
-        )
-        await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=True))
-    elif step == "bio":
-        text = (
-            f"{prefix}💬 <b>Шаг 4 из 5 — Расскажи немного о себе</b>\n\n"
-            "Чем увлекаешься, кого хочешь найти? (до 350 символов):"
-        )
-        await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=True))
-    elif step == "photo":
-        text = (
-            f"{prefix}📸 <b>Шаг 5 из 5 — Отправь своё фото</b>\n\n"
-            "Анкеты с фотографией получают в 8 раз больше лайков!\n"
-            "Отправь фото как картинку или нажми «Пропустить фото»:"
-        )
-        await send_screen(bot, user_id, text, reply_markup=reg_nav_kb(can_back=True, skip_photo=True))
-
-
-async def notify_inviter_on_registration(bot: Bot, inviter_id: int, friend_name: str, new_ref_count: int) -> None:
-    vip_bonus_str = (
-        "\n👑 <b>СУПЕР-БОНУС: Ты пригласил(а) 3 друзей и получаешь +24 часа VIP-статуса и +1 Супер-письмо!</b>"
-        if new_ref_count % 3 == 0
-        else f"\n👑 До бесплатного VIP осталось пригласить: <b>{3 - (new_ref_count % 3)} чел.</b>"
-    )
-    try:
-        await bot.send_message(
-            inviter_id,
-            f"🎉 <b>Твой друг {html.escape(friend_name)} создал(а) анкету по твоей ссылке!</b>\n\n"
-            f"🎁 Тебе начислено:\n"
-            f"• <b>+1 Супер-письмо 💌</b>\n"
-            f"• <b>+6 часов поднятия анкеты в ТОП 🚀</b>"
-            f"{vip_bonus_str}",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🎁 Моя рефералка", callback_data="menu:referral")],
-                    [vpn_button()],
-                ]
-            ),
-        )
-    except Exception:
-        pass
-
-
-# =========================
-# HANDLERS
-# =========================
-dp = Dispatcher(storage=MemoryStorage())
-
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-
-    user_id = message.from_user.id
-    args = (command.args or "").strip()
-
-    ref_notice = None
-    if args.startswith("ref_"):
-        raw_inv = args.replace("ref_", "").strip()
-        if raw_inv.isdigit():
-            inviter_id = int(raw_inv)
-            if save_pending_referral(user_id, inviter_id):
-                ref_notice = "🎁 <b>Ты перешёл(ла) по приглашению друга!</b>\nСоздай анкету сейчас и получи <b>2 Супер-письма 💌</b> в подарок!"
-
-    if get_profile(user_id):
-        update_username(user_id, message.from_user.username)
-
-    await render_home(bot, user_id, notice=ref_notice)
-
-
-@dp.message(Command("paysupport"))
-async def cmd_paysupport(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.set_state(SupportState.waiting_text)
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    text = (
-        "🛟 <b>Поддержка по платежам и VIP-услугам</b>\n\n"
-        "Опиши свой вопрос, укажи время оплаты или приложи детали — сообщение сразу получит администратор.\n\n"
-        "Напиши обращение одним сообщением ниже 👇"
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home")]]
-    )
-    await send_screen(bot, message.from_user.id, text, reply_markup=kb)
-
-
-@dp.message(SupportState.waiting_text)
-async def handle_support_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    await state.clear()
-
-    if ADMIN_ID:
-        user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID {message.from_user.id}"
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"🆘 <b>Обращение в /paysupport</b>\n"
-                f"От: {user_info} (<code>{message.from_user.id}</code>)\n\n"
-                f"Текст:\n{html.escape(message.text or '<без текста>')}",
-            )
-        except Exception:
-            pass
-
-    await render_home(bot, message.from_user.id, notice="✅ <b>Твоё обращение отправлено в поддержку!</b>")
-
-
-# --- АДМИН-ПАНЕЛЬ (/admin) ---
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    if message.from_user.id != ADMIN_ID or ADMIN_ID == 0:
-        await render_home(bot, message.from_user.id)
-        return
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS cnt FROM profiles")
-    total_users = int(cur.fetchone()["cnt"])
-
-    cur.execute("SELECT COUNT(*) AS cnt FROM profiles WHERE vip_until > ?", (now_ts(),))
-    vip_users = int(cur.fetchone()["cnt"])
-
-    cur.execute("SELECT COUNT(*) AS cnt FROM profiles WHERE referred_by > 0")
-    ref_invited = int(cur.fetchone()["cnt"])
-
-    cur.execute(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS rev, COALESCE(SUM(commission), 0) AS comm FROM orders WHERE status = 'paid'"
-    )
-    ord_row = cur.fetchone()
-    paid_orders = int(ord_row["cnt"])
-    total_rev = int(ord_row["rev"])
-    total_comm = int(ord_row["comm"])
-    conn.close()
-
-    token_ok = bool(YOOMONEY_TOKEN and "ваш_" not in YOOMONEY_TOKEN.lower() and len(YOOMONEY_TOKEN) >= 20)
-
-    text = (
-        "👑 <b>Панель управления и Монетизации</b>\n\n"
-        f"👥 Всего анкет в базе: <b>{total_users}</b>\n"
-        f"🤝 Пришли по рефералке: <b>{ref_invited}</b>\n"
-        f"💎 Активных VIP-подписок: <b>{vip_users}</b>\n"
-        f"💳 Успешных оплат: <b>{paid_orders}</b>\n"
-        f"💰 Общий оборот: <b>{total_rev} ₽</b>\n"
-        f"📈 Чистая комиссия ({COMMISSION_PERCENT}%): <b>{total_comm} ₽</b>\n\n"
-        f"👛 Кошелек ЮMoney: <code>{YOOMONEY_WALLET or 'Не задан в .env'}</code>\n"
-        f"🔑 Режим проверки оплат: <b>{'Авто (API) + Ручной ✅' if token_ok else 'Подтверждение в 1 клик в боте ✅'}</b>"
-    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Сделать рассылку по базе", callback_data="admin:broadcast")],
-            [InlineKeyboardButton(text="🎁 Выдать VIP на 7 дней по ID", callback_data="admin:gift_vip")],
-            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
+            [InlineKeyboardButton(text="📲 Поделиться ссылкой в 1 клик", url=share_url)],
+            [InlineKeyboardButton(text="🏆 ТОП-10 лучших приглашающих", callback_data="ref:leaderboard")],
+            [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+            [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
         ]
     )
-    await send_screen(bot, message.from_user.id, text, reply_markup=kb)
+    await send_screen(bot, uid, text, reply_markup=kb)
 
 
-@dp.callback_query(F.data == "admin:gift_vip")
-async def cb_admin_gift_vip(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer()
-        return
-    await callback.answer()
-    await state.set_state(AdminGiftState.waiting_user_id)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home")]]
-    )
-    await send_screen(
-        bot,
-        callback.from_user.id,
-        "🎁 <b>Отправь Telegram ID пользователя, которому нужно начислить 7 дней VIP + 3 Супер-письма:</b>",
-        reply_markup=kb,
-    )
-
-
-@dp.message(AdminGiftState.waiting_user_id)
-async def handle_admin_gift_vip(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    await state.clear()
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    raw = (message.text or "").strip()
-    if not raw.isdigit() or not get_profile(int(raw)):
-        await render_home(bot, message.from_user.id, notice="⚠️ <b>Пользователь с таким ID не найден в базе анкет.</b>")
-        return
-
-    target_uid = int(raw)
-    add_vip_days(target_uid, 7, bonus_superlikes=3)
-    try:
-        await bot.send_message(
-            target_uid,
-            "👑 <b>Администратор начислил тебе VIP-статус на 7 дней и +3 Супер-письма!</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
-        )
-    except Exception:
-        pass
-
-    await render_home(bot, message.from_user.id, notice=f"✅ <b>VIP на 7 дней выдан пользователю {target_uid}!</b>")
-
-
-@dp.callback_query(F.data == "admin:broadcast")
-async def cb_admin_broadcast(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer()
-        return
-    await callback.answer()
-    await state.set_state(AdminBroadcastState.waiting_post)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home")]]
-    )
-    await send_screen(
-        bot,
-        callback.from_user.id,
-        "📢 <b>Отправь текст рекламного или информационного поста для рассылки всем пользователям:</b>",
-        reply_markup=kb,
-    )
-
-
-@dp.message(AdminBroadcastState.waiting_post)
-async def handle_admin_broadcast(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    await state.clear()
-    if message.from_user.id != ADMIN_ID or not message.text:
-        await render_home(bot, message.from_user.id)
-        return
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM profiles")
-    users = [int(r["user_id"]) for r in cur.fetchall()]
-    conn.close()
-
-    sent = 0
-    for uid in users:
-        try:
-            await bot.send_message(
-                uid,
-                message.text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
-            )
-            sent += 1
-            await asyncio.sleep(0.04)
-        except Exception:
-            pass
-
-    await render_home(bot, message.from_user.id, notice=f"✅ <b>Рассылка завершена! Доставлено: {sent} чел.</b>")
-
-
-# --- НАВИГАЦИЯ ПО МЕНЮ И РЕФЕРАЛКЕ ---
-@dp.callback_query(F.data == "menu:home")
-async def cb_home(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    await callback.answer()
-    await render_home(bot, callback.from_user.id)
-
-
-@dp.callback_query(F.data == "menu:me")
-async def cb_me(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    await callback.answer()
-    await render_home(bot, callback.from_user.id)
-
-
-@dp.callback_query(F.data == "menu:referral")
-async def cb_referral(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    await render_referral_screen(bot, callback.from_user.id)
-
-
-@dp.callback_query(F.data == "ref:leaderboard")
-async def cb_ref_leaderboard(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    top_rows = get_top_referrers(limit=10)
-
-    lines = ["🏆 <b>ТОП-10 амбассадоров «Лавчика»</b>\n"]
-    if not top_rows:
-        lines.append("<i>Пока никто не пригласил друзей. Стань первым в рейтинге и забери бесплатный VIP!</i>")
+@router.callback_query(F.data == "ref:leaderboard")
+async def cb_ref_leaderboard(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    await call.answer()
+    top = db.get_top_referrers(limit=10)
+    lines = [
+        "🏆 <b>ТОП-10 амбассадоров «Лавчик»</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not top:
+        lines.append("Список пока пуст. Пригласи первого друга и займи 1-е место! 🥇")
     else:
         medals = ["🥇", "🥈", "🥉"]
-        for idx, r in enumerate(top_rows, start=1):
-            badge = medals[idx - 1] if idx <= 3 else f"{idx}."
-            vip_mark = " 👑" if int(r["vip_until"]) > now_ts() else ""
-            lines.append(
-                f"{badge} <b>{html.escape(str(r['name']))}, {r['age']}</b> ({html.escape(str(r['city']))}){vip_mark} — <b>{r['ref_count']} др.</b>"
-            )
+        for idx, r in enumerate(top, start=1):
+            medal = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+            lines.append(f"{medal} <b>{r['name']}</b> ({r['city']}) — 👥 <b>{r['ref_count']}</b> друзей")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад к моей ссылке", callback_data="menu:referral")],
+            [InlineKeyboardButton(text="⬅️ Назад к моей ссылке", callback_data="ref:menu")],
             [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
         ]
     )
-    await send_screen(bot, callback.from_user.id, "\n".join(lines), reply_markup=kb)
+    await send_screen(bot, call.from_user.id, "\n".join(lines), reply_markup=kb)
 
 
-@dp.callback_query(F.data == "menu:browse")
-async def cb_browse(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    await render_next_candidate(bot, callback.from_user.id)
+# =========================
+# СИСТЕМА ОТЗЫВОВ (⭐️ ОТЗЫВЫ)
+# =========================
+async def render_reviews_screen(bot: Bot, db: Database, user_id: int, offset: int = 0) -> None:
+    total_cnt, avg_rating = db.get_reviews_stats()
+    reviews = db.list_reviews(limit=5, offset=offset)
 
-
-@dp.callback_query(F.data == "menu:settings")
-async def cb_settings(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    me = get_profile(callback.from_user.id)
-    if not me:
-        await render_home(bot, callback.from_user.id)
-        return
-
-    text = format_profile_card(me, title="⚙️ <b>Настройки твоей анкеты</b>", show_status=True)
-    await send_screen(
-        bot,
-        callback.from_user.id,
-        text,
-        reply_markup=settings_kb(callback.from_user.id),
-        photo_id=me["photo_id"],
+    stars_header = "⭐️" * int(round(avg_rating)) if total_cnt > 0 else "⭐️⭐️⭐️⭐️⭐️"
+    header = (
+        f"⭐️ <b>Отзывы участников «Лавчик»</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Средняя оценка:</b> {avg_rating} / 5.0 {stars_header}\n"
+        f"💬 <b>Всего отзывов:</b> {total_cnt}\n"
+        f"🎁 <i>За свой первый отзыв ты получишь +1 💌 Супер-письмо бесплатно!</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
+    if not reviews:
+        body = "\nПока никто не оставил отзыв. Стань первым и получи <b>+1 💌 Супер-письмо</b> в подарок! 👇"
+    else:
+        blocks: List[str] = []
+        for r in reviews:
+            st = "⭐️" * int(r["rating"])
+            date_str = time.strftime("%d.%m.%Y", time.localtime(int(r["created_at"])))
+            blocks.append(
+                f"👤 <b>{r['author_name']}</b> ({date_str}) — {st}\n"
+                f"<blockquote>{r['text']}</blockquote>"
+            )
+        body = "\n\n".join(blocks)
 
-@dp.callback_query(F.data == "settings:toggle")
-async def cb_settings_toggle(callback: CallbackQuery, bot: Bot) -> None:
-    me = get_profile(callback.from_user.id)
-    if not me:
-        await callback.answer()
-        await render_home(bot, callback.from_user.id)
+    nav_row: List[InlineKeyboardButton] = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"reviews:page:{max(0, offset - 5)}"))
+    if offset + 5 < total_cnt:
+        nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"reviews:page:{offset + 5}"))
+
+    kb_rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="✍️ Оставить отзыв (+1 💌 в подарок)", callback_data="reviews:add")]
+    ]
+    if nav_row:
+        kb_rows.append(nav_row)
+    kb_rows.append([InlineKeyboardButton(text="🛠 Нашли ошибку? Написать в поддержку", url=SUPPORT_URL)])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")])
+
+    await send_screen(bot, user_id, header + body, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data == "reviews:menu")
+async def cb_reviews_menu(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    await state.clear()
+    await call.answer()
+    await render_reviews_screen(bot, db, call.from_user.id, offset=0)
+
+
+@router.callback_query(F.data.startswith("reviews:page:"))
+async def cb_reviews_page(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    await call.answer()
+    offset = int(call.data.split(":")[2])
+    await render_reviews_screen(bot, db, call.from_user.id, offset=offset)
+
+
+@router.callback_query(F.data == "reviews:add")
+async def cb_reviews_add(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer("Сначала создай анкету, чтобы оставить отзыв!", show_alert=True)
         return
 
-    new_active = int(me["active"]) == 0
-    set_active(callback.from_user.id, new_active)
-    status_msg = "👁 Анкета снова видна в поиске!" if new_active else "🙈 Анкета скрыта из поиска"
-    await callback.answer(status_msg)
-
-    me_updated = get_profile(callback.from_user.id)
-    text = format_profile_card(me_updated, title="⚙️ <b>Настройки твоей анкеты</b>", show_status=True)
-    await send_screen(
-        bot,
-        callback.from_user.id,
-        text,
-        reply_markup=settings_kb(callback.from_user.id),
-        photo_id=me_updated["photo_id"],
-    )
-
-
-@dp.callback_query(F.data == "settings:delete")
-async def cb_settings_delete(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
+    await call.answer()
+    await state.set_state(ReviewForm.waiting_rating)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Да, удалить навсегда", callback_data="settings:delete_confirm")],
+            [InlineKeyboardButton(text="⭐️⭐️⭐️⭐️⭐️ Отлично (5)", callback_data="reviews:rate:5")],
+            [InlineKeyboardButton(text="⭐️⭐️⭐️⭐️ Хорошо (4)", callback_data="reviews:rate:4")],
+            [InlineKeyboardButton(text="⭐️⭐️⭐️ Нормально (3)", callback_data="reviews:rate:3")],
+            [InlineKeyboardButton(text="⭐️⭐️ Плохо (2)", callback_data="reviews:rate:2")],
+            [InlineKeyboardButton(text="⭐️ Ужасно (1)", callback_data="reviews:rate:1")],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:settings"),
+                InlineKeyboardButton(text="⬅️ Назад к отзывам", callback_data="reviews:menu"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
             ],
         ]
     )
     await send_screen(
         bot,
-        callback.from_user.id,
-        "⚠️ <b>Ты уверен(а), что хочешь удалить анкету?</b>\n\nВсе твои симпатии, матчи и история будут стерты.",
+        uid,
+        "✍️ <b>Оставить отзыв о боте «Лавчик»</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Шаг 1 из 2: Выбери оценку работы нашего бота от 1 до 5 звёзд 👇",
         reply_markup=kb,
     )
 
 
-@dp.callback_query(F.data == "settings:delete_confirm")
-async def cb_settings_delete_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+@router.callback_query(ReviewForm.waiting_rating, F.data.startswith("reviews:rate:"))
+async def cb_reviews_rate(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    rating = int(call.data.split(":")[2])
+    await state.update_data(rating=rating)
+    await state.set_state(ReviewForm.waiting_text)
+
+    stars = "⭐️" * rating
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Изменить оценку", callback_data="reviews:add"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="reviews:menu"),
+            ]
+        ]
+    )
+    await send_screen(
+        bot,
+        call.from_user.id,
+        f"✍️ <b>Твоя оценка:</b> {stars}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Шаг 2 из 2: Напиши текст своего отзыва (от 5 до 400 символов) и отправь в чат 👇\n\n"
+        "<i>Расскажи, что тебе нравится в боте или кого удалось найти!</i>",
+        reply_markup=kb,
+    )
+
+
+@router.message(ReviewForm.waiting_text)
+async def msg_reviews_text(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    kb_err = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Изменить оценку", callback_data="reviews:add"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="reviews:menu"),
+            ]
+        ]
+    )
+    if len(text) < 5 or len(text) > 400:
+        await send_screen(
+            bot,
+            uid,
+            "⚠️ <b>Текст отзыва должен быть от 5 до 400 символов.</b>\nПопробуй написать чуть подробнее:",
+            reply_markup=kb_err,
+        )
+        return
+
+    data = await state.get_data()
+    rating = int(data.get("rating", 5))
     await state.clear()
-    delete_profile(callback.from_user.id)
-    await callback.answer("Анкета удалена")
-    await render_home(bot, callback.from_user.id, notice="🗑 <b>Твоя анкета была успешно удалена.</b>")
+
+    p = db.get_profile(uid)
+    author_name = f"{p['name']}, {p['city']}" if p else (message.from_user.full_name or "Участник")
+
+    rev_id, is_first = db.add_or_update_review(uid, author_name, rating, text)
+    bonus_line = ""
+    if is_first:
+        db.add_superlikes(uid, 1)
+        bonus_line = "\n🎁 <b>Бонус начислен:</b> Тебе выдано <b>+1 💌 Супер-письмо</b> за первый отзыв!"
+
+    if ADMIN_ID > 0:
+        try:
+            adm_kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить отзыв", callback_data=f"adminrev:del:{rev_id}")]]
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                f"⭐️ <b>Новый отзыв #{rev_id}</b>\n"
+                f"👤 Автор: {author_name} (ID: <code>{uid}</code>)\n"
+                f"Оценка: {'⭐️' * rating}\n\n"
+                f"<blockquote>{text}</blockquote>",
+                reply_markup=adm_kb,
+            )
+        except Exception:
+            pass
+
+    kb_done = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⭐️ Посмотреть все отзывы", callback_data="reviews:menu")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+        ]
+    )
+    await send_screen(
+        bot,
+        uid,
+        f"✅ <b>Спасибо! Твой отзыв успешно опубликован!</b>{bonus_line}",
+        reply_markup=kb_done,
+    )
 
 
-# --- РЕГИСТРАЦИЯ И РЕДАКТИРОВАНИЕ С КНОПКАМИ "НАЗАД" И "ОТМЕНА" ---
-@dp.callback_query(F.data == "profile:create")
-async def cb_profile_create(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await callback.answer()
+@router.callback_query(F.data.startswith("adminrev:del:"))
+async def cb_admin_delete_review(call: CallbackQuery, db: Database) -> None:
+    if call.from_user.id != ADMIN_ID:
+        return
+    rev_id = int(call.data.split(":")[2])
+    deleted = db.delete_review(rev_id)
+    await call.answer("Отзыв удалён!" if deleted else "Отзыв уже был удалён.", show_alert=True)
+    try:
+        await call.message.edit_text(f"🗑 <b>Отзыв #{rev_id} был удалён администратором.</b>")
+    except Exception:
+        pass
+
+
+# =========================
+# 5-ШАГОВАЯ АНКЕТА С "НАЗАД"
+# =========================
+async def ask_step_name(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.name)
+    await send_screen(
+        bot,
+        user_id,
+        "📝 <b>Создание анкеты (Шаг 1 из 5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Как тебя зовут? Напиши своё имя в чат:",
+        reply_markup=kb_form_nav(back_step=None),
+    )
+
+
+async def ask_step_age(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.age)
+    await send_screen(
+        bot,
+        user_id,
+        "🎂 <b>Создание анкеты (Шаг 2 из 5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Сколько тебе лет? Отправь число от <b>14</b> до <b>80</b>:",
+        reply_markup=kb_form_nav(back_step="name"),
+    )
+
+
+async def ask_step_city(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.city)
+    await send_screen(
+        bot,
+        user_id,
+        "🏙 <b>Создание анкеты (Шаг 3 из 5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Из какого ты города? Напиши название города:",
+        reply_markup=kb_form_nav(back_step="age"),
+    )
+
+
+async def ask_step_bio(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.bio)
+    await send_screen(
+        bot,
+        user_id,
+        "💬 <b>Создание анкеты (Шаг 4 из 5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Расскажи немного о себе: чем увлекаешься, кого хочешь найти?",
+        reply_markup=kb_form_nav(back_step="city"),
+    )
+
+
+async def ask_step_photo(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.photo)
+    await send_screen(
+        bot,
+        user_id,
+        "📸 <b>Создание анкеты (Шаг 5 из 5)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отправь своё лучшее фото для анкеты (с фото ты получишь в 5 раз больше лайков!) или нажми «Пропустить фото»:",
+        reply_markup=kb_form_nav(back_step="bio", allow_skip_photo=True),
+    )
+
+
+@router.callback_query(F.data == "profile:create")
+async def cb_profile_create(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
     await state.clear()
-    await state.set_state(RegStates.name)
-    await render_reg_step(bot, callback.from_user.id, "name")
+    await ask_step_name(bot, call.from_user.id, state)
 
 
-@dp.callback_query(F.data == "reg:cancel")
-async def cb_reg_cancel(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+@router.callback_query(F.data == "form:cancel")
+async def cb_form_cancel(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
     await state.clear()
-    await callback.answer("Отменено")
-    await render_home(bot, callback.from_user.id, notice="❌ <b>Заполнение анкеты отменено.</b>")
+    await call.answer("Создание анкеты отменено")
+    await render_home(bot, db, call.from_user.id)
 
 
-@dp.callback_query(F.data == "reg:back")
-async def cb_reg_back(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await callback.answer()
-    current = await state.get_state()
-    if current == RegStates.age.state:
-        await state.set_state(RegStates.name)
-        await render_reg_step(bot, callback.from_user.id, "name")
-    elif current == RegStates.city.state:
-        await state.set_state(RegStates.age)
-        await render_reg_step(bot, callback.from_user.id, "age")
-    elif current == RegStates.bio.state:
-        await state.set_state(RegStates.city)
-        await render_reg_step(bot, callback.from_user.id, "city")
-    elif current == RegStates.photo.state:
-        await state.set_state(RegStates.bio)
-        await render_reg_step(bot, callback.from_user.id, "bio")
-    else:
-        await state.clear()
-        await render_home(bot, callback.from_user.id)
+@router.callback_query(F.data.startswith("form:back:"))
+async def cb_form_back(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    step = call.data.split(":", 2)[2]
+    uid = call.from_user.id
+    if step == "name":
+        await ask_step_name(bot, uid, state)
+    elif step == "age":
+        await ask_step_age(bot, uid, state)
+    elif step == "city":
+        await ask_step_city(bot, uid, state)
+    elif step == "bio":
+        await ask_step_bio(bot, uid, state)
 
 
-@dp.message(RegStates.name)
-async def reg_name(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
+@router.message(ProfileForm.name)
+async def form_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
     name = (message.text or "").strip()
-    if len(name) < 2 or len(name) > 30:
-        await render_reg_step(bot, message.from_user.id, "name", error_msg="Имя должно быть от 2 до 30 символов.")
+    if len(name) < 2 or len(name) > 32:
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Имя должно быть от 2 до 32 символов.</b>\nПопробуй ввести имя ещё раз:",
+            reply_markup=kb_form_nav(back_step=None),
+        )
         return
-
     await state.update_data(name=name)
-    await state.set_state(RegStates.age)
-    await render_reg_step(bot, message.from_user.id, "age")
+    await ask_step_age(bot, message.from_user.id, state)
 
 
-@dp.message(RegStates.age)
-async def reg_age(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
+@router.message(ProfileForm.age)
+async def form_age(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
     raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await render_reg_step(bot, message.from_user.id, "age", error_msg="Введи возраст только цифрами (например: 19).")
+    if not raw.isdigit() or not (14 <= int(raw) <= 80):
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Введи корректный возраст числом от 14 до 80:</b>",
+            reply_markup=kb_form_nav(back_step="name"),
+        )
         return
-
-    age = int(raw)
-    if age < 14 or age > 80:
-        await render_reg_step(bot, message.from_user.id, "age", error_msg="Допустимый возраст — от 14 до 80 лет.")
-        return
-
-    await state.update_data(age=age)
-    await state.set_state(RegStates.city)
-    await render_reg_step(bot, message.from_user.id, "city")
+    await state.update_data(age=int(raw))
+    await ask_step_city(bot, message.from_user.id, state)
 
 
-@dp.message(RegStates.city)
-async def reg_city(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
+@router.message(ProfileForm.city)
+async def form_city(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
     city = (message.text or "").strip()
     if len(city) < 2 or len(city) > 40:
-        await render_reg_step(bot, message.from_user.id, "city", error_msg="Название города должно быть от 2 до 40 символов.")
-        return
-
-    await state.update_data(city=city)
-    await state.set_state(RegStates.bio)
-    await render_reg_step(bot, message.from_user.id, "bio")
-
-
-@dp.message(RegStates.bio)
-async def reg_bio(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    bio = (message.text or "").strip()
-    if len(bio) < 5 or len(bio) > 350:
-        await render_reg_step(bot, message.from_user.id, "bio", error_msg="Описание должно быть от 5 до 350 символов.")
-        return
-
-    await state.update_data(bio=bio)
-    await state.set_state(RegStates.photo)
-    await render_reg_step(bot, message.from_user.id, "photo")
-
-
-@dp.callback_query(RegStates.photo, F.data == "reg:skip_photo")
-async def reg_skip_photo(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await callback.answer()
-    data = await state.get_data()
-    is_new, inviter_id, new_ref_cnt = upsert_profile(
-        user_id=callback.from_user.id,
-        username=callback.from_user.username,
-        name=data["name"],
-        age=int(data["age"]),
-        city=data["city"],
-        bio=data["bio"],
-        photo_id=None,
-    )
-    await state.clear()
-
-    if is_new and inviter_id:
-        await notify_inviter_on_registration(bot, inviter_id, data["name"], new_ref_cnt)
-        await render_home(
-            bot,
-            callback.from_user.id,
-            notice="🎉 <b>Анкета сохранена! Тебе начислено 2 Супер-письма 💌 по приглашению друга!</b>",
-        )
-    else:
-        await render_home(bot, callback.from_user.id, notice="🎉 <b>Анкета успешно сохранена!</b>")
-
-
-@dp.message(RegStates.photo)
-async def reg_photo(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    if not message.photo:
-        await render_reg_step(
+        await send_screen(
             bot,
             message.from_user.id,
-            "photo",
-            error_msg="Пожалуйста, отправь именно фотографию или нажми «Пропустить фото».",
+            "⚠️ <b>Название города должно быть от 2 до 40 символов:</b>",
+            reply_markup=kb_form_nav(back_step="age"),
         )
         return
+    await state.update_data(city=city)
+    await ask_step_bio(bot, message.from_user.id, state)
 
-    photo_id = message.photo[-1].file_id
-    data = await state.get_data()
-    is_new, inviter_id, new_ref_cnt = upsert_profile(
-        user_id=message.from_user.id,
-        username=message.from_user.username,
-        name=data["name"],
+
+@router.message(ProfileForm.bio)
+async def form_bio(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
+    bio = (message.text or "").strip()
+    if len(bio) < 10 or len(bio) > 500:
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Описание должно быть от 10 до 500 символов.</b>\nНапиши чуть подробнее о себе:",
+            reply_markup=kb_form_nav(back_step="city"),
+        )
+        return
+    await state.update_data(bio=bio)
+    await ask_step_photo(bot, message.from_user.id, state)
+
+
+async def finalize_profile_creation(
+    bot: Bot, db: Database, user_id: int, username: Optional[str], data: dict, photo_id: Optional[str]
+) -> None:
+    is_new = db.upsert_profile(
+        user_id=user_id,
+        username=username,
+        name=str(data["name"]),
         age=int(data["age"]),
-        city=data["city"],
-        bio=data["bio"],
+        city=str(data["city"]),
+        bio=str(data["bio"]),
         photo_id=photo_id,
     )
+
+    if is_new:
+        inviter_id = db.pop_pending_referral(user_id)
+        if inviter_id > 0:
+            new_cnt, got_vip = db.reward_referral_signup(inviter_id, user_id)
+            if new_cnt > 0:
+                milestone_text = (
+                    "\n👑 <b>СУПЕР-БОНУС:</b> Ты пригласил ещё 3-х друзей и получаешь <b>+24 часа VIP-статуса</b> и бонусное Супер-письмо!"
+                    if got_vip
+                    else ""
+                )
+                try:
+                    await bot.send_message(
+                        inviter_id,
+                        f"🎉 <b>По твоей ссылке зарегистрировался новый друг ({data['name']})!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎁 Тебе начислено:\n"
+                        f"• <b>+1 💌 Супер-письмо</b>\n"
+                        f"• <b>+6 часов 🚀 ТОП-продвижения</b>\n"
+                        f"👥 Всего приглашено друзей: <b>{new_cnt}</b>{milestone_text}",
+                    )
+                except Exception:
+                    pass
+
+    await render_home(bot, db, user_id)
+
+
+@router.callback_query(ProfileForm.photo, F.data == "form:skip_photo")
+async def form_skip_photo(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    await call.answer("Анкета сохранена!")
+    data = await state.get_data()
     await state.clear()
-
-    if is_new and inviter_id:
-        await notify_inviter_on_registration(bot, inviter_id, data["name"], new_ref_cnt)
-        await render_home(
-            bot,
-            message.from_user.id,
-            notice="🎉 <b>Анкета с фото сохранена! Тебе начислено 2 Супер-письма 💌 по приглашению друга!</b>",
-        )
-    else:
-        await render_home(bot, message.from_user.id, notice="🎉 <b>Анкета с фото успешно сохранена!</b>")
+    await finalize_profile_creation(bot, db, call.from_user.id, call.from_user.username, data, photo_id=None)
 
 
-# --- ЛАЙКИ, СУПЕР-ПИСЬМА, МАТЧИ И "КТО ЛАЙКНУЛ" ---
-@dp.callback_query(F.data.startswith("act:"))
-async def cb_candidate_action(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
+@router.message(ProfileForm.photo, F.photo)
+async def form_photo_ok(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    await state.clear()
+    await finalize_profile_creation(bot, db, message.from_user.id, message.from_user.username, data, photo_id=photo_id)
+
+
+@router.message(ProfileForm.photo)
+async def form_photo_invalid(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await send_screen(
+        bot,
+        message.from_user.id,
+        "⚠️ <b>Пожалуйста, отправь именно фотографию</b> или нажми кнопку «Пропустить фото» ниже:",
+        reply_markup=kb_form_nav(back_step="bio", allow_skip_photo=True),
+    )
+
+
+@router.callback_query(F.data == "profile:me")
+async def cb_profile_me(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    await call.answer()
+    await render_home(bot, db, call.from_user.id)
+
+
+# =========================
+# ПРОСМОТР АНКЕТ И ЛАЙКИ
+# =========================
+async def show_next_candidate(bot: Bot, db: Database, user_id: int) -> None:
+    me = db.get_profile(user_id)
+    if not me:
+        await render_home(bot, db, user_id)
         return
 
-    action = parts[1]
-    target_id = int(parts[2])
-    user_id = callback.from_user.id
+    candidate = db.find_candidate(user_id, city_prioritized=True)
+    if not candidate:
+        is_adult = int(me["age"]) >= 18
+        kb_rows: List[List[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data="browse:next")],
+        ]
+        if is_adult and PAYMENTS_ENABLED:
+            kb_rows.append(
+                [InlineKeyboardButton(text="🔄 Сбросить пропущенные анкеты", callback_data="shop:buy:reset_skips")]
+            )
+        kb_rows.append([InlineKeyboardButton(text="🎁 Пригласить друзей (+VIP)", callback_data="ref:menu")])
+        kb_rows.append([InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)])
+        kb_rows.append([InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")])
 
-    me = get_profile(user_id)
-    target = get_profile(target_id)
-    if not me or not target:
-        await callback.answer("Анкета больше недоступна")
-        await render_next_candidate(bot, user_id)
-        return
-
-    if not same_age_group(int(me["age"]), int(target["age"])):
-        await callback.answer("Возрастное ограничение!", show_alert=True)
-        await render_next_candidate(bot, user_id)
-        return
-
-    if action == "super":
-        if int(me["superlikes"]) <= 0:
-            await callback.answer("У тебя закончились Супер-письма! Пополни их или пригласи друга.", show_alert=True)
-            await render_shop_item(bot, user_id, "super_5")
-            return
-
-        await callback.answer()
-        await state.set_state(SuperMsgState.waiting_text)
-        await state.update_data(target_id=target_id)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="⬅️ Назад к анкете", callback_data="menu:browse"),
-                    InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
-                ]
-            ]
-        )
         await send_screen(
             bot,
             user_id,
-            f"💌 <b>Супер-письмо для {html.escape(target['name'])}</b>\n\n"
-            f"Напиши сообщение (до 300 символов). Мы мгновенно доставим его вместе со ссылкой на твой профиль!\n"
-            f"<i>Осталось Супер-писем: {int(me['superlikes'])} шт.</i>",
-            reply_markup=kb,
+            "🔍 <b>Новые анкеты вокруг тебя пока закончились!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Ты просмотрел всех доступных участников своей возрастной категории.\n\n"
+            "💡 <i>Совет: ты можешь сбросить пропущенные анкеты или пригласить друзей и получить бесплатный VIP!</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         )
         return
 
+    text = format_profile_card(candidate, title="Найдена анкета")
+    await send_screen(
+        bot,
+        user_id,
+        text,
+        reply_markup=kb_candidate(int(candidate["user_id"])),
+        photo_id=candidate["photo_id"] if candidate["photo_id"] else None,
+    )
+
+
+@router.callback_query(F.data == "browse:next")
+async def cb_browse_next(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    await call.answer()
+    await show_next_candidate(bot, db, call.from_user.id)
+
+
+@router.callback_query(F.data.startswith("react:"))
+async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    user_id = call.from_user.id
+    me = db.get_profile(user_id)
+    if not me:
+        await call.answer()
+        await render_home(bot, db, user_id)
+        return
+
+    _, action, raw_target = call.data.split(":", 2)
+    target_id = int(raw_target)
+    target = db.get_profile(target_id)
+
+    if not target or int(target["active"]) == 0:
+        await call.answer("Эта анкета больше не активна.")
+        await show_next_candidate(bot, db, user_id)
+        return
+
+    if (int(me["age"]) < 18) != (int(target["age"]) < 18):
+        await call.answer("Анкета недоступна по возрастному ограничению.", show_alert=True)
+        await show_next_candidate(bot, db, user_id)
+        return
+
     if action == "skip":
-        add_reaction(user_id, target_id, "skip")
-        await callback.answer("Пропущено 👎")
-        await render_next_candidate(bot, user_id)
-        return
-
-    if action == "block":
-        block_user(user_id, target_id)
-        add_reaction(user_id, target_id, "block")
-        await callback.answer("Пользователь добавлен в ЧС 🚫")
-        await render_next_candidate(bot, user_id)
-        return
-
-    if action == "report":
-        report_user(user_id, target_id)
-        block_user(user_id, target_id)
-        add_reaction(user_id, target_id, "report")
-        await callback.answer("Жалоба отправлена модераторам ⚠️")
-        if ADMIN_ID:
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ <b>Жалоба на анкету</b>\n"
-                    f"От: <code>{user_id}</code>\n"
-                    f"На: <code>{target_id}</code> ({html.escape(target['name'])}, {target['age']})",
-                )
-            except Exception:
-                pass
-        await render_next_candidate(bot, user_id)
+        db.record_reaction(user_id, target_id, "skip")
+        await call.answer("Дальше 👎")
+        await show_next_candidate(bot, db, user_id)
         return
 
     if action == "like":
-        if not is_vip(me) and is_adult_age(int(me["age"])):
-            today_cnt = count_today_likes(user_id)
-            if today_cnt >= FREE_DAILY_LIKES:
-                await callback.answer("Дневной лимит бесплатных лайков исчерпан!", show_alert=True)
-                await render_shop_item(
-                    bot,
-                    user_id,
-                    "vip_7",
-                    custom_notice=f"🔥 <b>Ты поставил(а) максимум бесплатных лайков за сегодня ({FREE_DAILY_LIKES} из {FREE_DAILY_LIKES})!</b>\nПодключи VIP или пригласи друзей, чтобы лайкать без ограничений:",
-                )
-                return
-
-        add_reaction(user_id, target_id, "like")
-
-        if has_liked(target_id, user_id):
-            add_match(user_id, target_id)
-            await callback.answer("🎉 Взаимная симпатия!")
-
-            my_link = (
-                f"@{me['username']}"
-                if me["username"]
-                else f"<a href='tg://user?id={user_id}'>{html.escape(me['name'])}</a>"
+        if not db.is_vip(user_id) and db.count_today_likes(user_id) >= FREE_DAILY_LIKES:
+            await call.answer("Дневной лимит бесплатных лайков исчерпан!", show_alert=True)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="👑 Подключить VIP (Безлимит)", callback_data="shop:buy:vip_7")],
+                    [InlineKeyboardButton(text="🎁 Получить VIP за друзей", callback_data="ref:menu")],
+                    [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+                    [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+                ]
             )
+            await send_screen(
+                bot,
+                user_id,
+                f"🔥 <b>Ты поставил максимум бесплатных лайков за сегодня ({FREE_DAILY_LIKES} шт.)!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Чтобы ставить лайки без ограничений и сразу видеть всех, кому ты понравился, подключи <b>👑 VIP-статус</b> или пригласи друзей!",
+                reply_markup=kb,
+            )
+            return
+
+        db.record_reaction(user_id, target_id, "like")
+
+        if db.has_liked(target_id, user_id):
+            db.create_match(user_id, target_id)
+            my_link = f"@{me['username']}" if me["username"] else f"<a href='tg://user?id={user_id}'>{me['name']}</a>"
             target_link = (
                 f"@{target['username']}"
                 if target["username"]
-                else f"<a href='tg://user?id={target_id}'>{html.escape(target['name'])}</a>"
+                else f"<a href='tg://user?id={target_id}'>{target['name']}</a>"
             )
 
             try:
                 await bot.send_message(
                     target_id,
-                    f"💞 <b>У тебя взаимная симпатия!</b>\n\n"
-                    f"Тебе ответил(а) взаимностью: <b>{html.escape(me['name'])}, {me['age']}</b> ({html.escape(me['city'])})\n"
+                    f"💞 <b>У тебя взаимная симпатия (Мэтч)!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Ты и <b>{me['name']}</b> ({me['age']}, {me['city']}) понравились друг другу!\n"
                     f"👉 Написать: {my_link}",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
-                )
-            except Exception:
-                pass
-
-            notice = (
-                f"💞 <b>Взаимная симпатия с {html.escape(target['name'])}!</b>\n"
-                f"👉 Контакт для общения: {target_link}"
-            )
-            await render_next_candidate(bot, user_id, prefix_notice=notice)
-        else:
-            await callback.answer("❤️ Лайк отправлен!")
-            try:
-                await bot.send_message(
-                    target_id,
-                    "🔥 <b>Кому-то понравилась твоя анкета!</b>\n"
-                    "Зайди в раздел «👀 Кто меня лайкнул», чтобы узнать кто это.",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [InlineKeyboardButton(text="👀 Посмотреть кто лайкнул", callback_data="menu:who_liked")],
-                            [vpn_button()],
+                            [InlineKeyboardButton(text="🔥 Продолжить поиск", callback_data="browse:next")],
+                            [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
                         ]
                     ),
                 )
             except Exception:
                 pass
 
-            await render_next_candidate(bot, user_id)
+            await call.answer("Взаимная симпатия! 💞")
+            await send_screen(
+                bot,
+                user_id,
+                f"💞 <b>Это взаимный Мэтч!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Ты понравился(ась) <b>{target['name']}</b> ({target['age']}, {target['city']})!\n"
+                f"👉 Начни общение прямо сейчас: {target_link}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🔥 Смотреть анкеты дальше", callback_data="browse:next")],
+                        [InlineKeyboardButton(text="💌 Все мои мэтчи", callback_data="matches:list")],
+                        [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+                        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:home")],
+                    ]
+                ),
+                photo_id=target["photo_id"] if target["photo_id"] else None,
+            )
+            return
+        else:
+            try:
+                await bot.send_message(
+                    target_id,
+                    "🔥 <b>Кому-то понравилась твоя анкета!</b>\n"
+                    "Загляни в раздел «👀 Кто меня лайкнул» или продолжай смотреть анкеты!",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="👀 Посмотреть, кто лайкнул", callback_data="likes:list")],
+                            [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                        ]
+                    ),
+                )
+            except Exception:
+                pass
+
+            await call.answer("Лайк отправлен ❤️")
+            await show_next_candidate(bot, db, user_id)
 
 
-@dp.message(SuperMsgState.waiting_text)
-async def handle_super_msg(message: Message, state: FSMContext, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    text_msg = (message.text or "").strip()
-    if len(text_msg) < 2 or len(text_msg) > 300:
+# =========================
+# КТО МЕНЯ ЛАЙКНУЛ (VIP-ФУНКЦИЯ)
+# =========================
+@router.callback_query(F.data == "likes:list")
+async def cb_likes_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    me = db.get_profile(uid)
+    if not me:
+        await call.answer()
+        await render_home(bot, db, uid)
+        return
+
+    admirers = db.get_who_liked_me(uid)
+    if not admirers:
+        await call.answer()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                [InlineKeyboardButton(text="🚀 Поднять анкету в ТОП", callback_data="shop:buy:boost_24")],
+                [InlineKeyboardButton(text="🎁 Бесплатный VIP и ТОП", callback_data="ref:menu")],
+                [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+            ]
+        )
         await send_screen(
             bot,
-            message.from_user.id,
-            "⚠️ <b>Сообщение должно быть от 2 до 300 символов. Попробуй ещё раз:</b>",
+            uid,
+            "👀 <b>Новых входящих лайков пока нет</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Лайкай других участников первым или подними свою анкету в 🚀 <b>ТОП</b>, чтобы получать в 10 раз больше внимания!",
+            reply_markup=kb,
+        )
+        return
+
+    is_vip = db.is_vip(uid)
+    is_adult = int(me["age"]) >= 18
+
+    if not is_vip and is_adult and PAYMENTS_ENABLED:
+        await call.answer()
+        count = len(admirers)
+        cities = list({str(a["city"]) for a in admirers[:3]})
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👑 Открыть список (Подключить VIP)", callback_data="shop:buy:vip_7")],
+                [InlineKeyboardButton(text="🎁 Получить VIP бесплатно за друзей", callback_data="ref:menu")],
+                [InlineKeyboardButton(text="🔥 Угадать в общем поиске", callback_data="browse:next")],
+                [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+                [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+            ]
+        )
+        await send_screen(
+            bot,
+            uid,
+            f"👀 <b>Твоя анкета понравилась {count} чел.!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Города поклонников: <b>{', '.join(cities)}</b>\n\n"
+            f"🔒 <i>Прямой просмотр списка тех, кто тебя лайкнул, доступен с 👑 VIP-статусом!</i>\n"
+            f"Подключи VIP в магазине или пригласи 3-х друзей и открой все анкеты сразу!",
+            reply_markup=kb,
+        )
+        return
+
+    await call.answer()
+    first = admirers[0]
+    text = format_profile_card(first, title=f"Тебя лайкнули! (Ещё {len(admirers)} чел.)")
+    await send_screen(
+        bot,
+        uid,
+        text,
+        reply_markup=kb_candidate(int(first["user_id"])),
+        photo_id=first["photo_id"] if first["photo_id"] else None,
+    )
+
+
+# =========================
+# СУПЕР-ПИСЬМО ("НАПИСАТЬ СРАЗУ")
+# =========================
+@router.callback_query(F.data.startswith("super:ask:"))
+async def cb_super_ask(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    me = db.get_profile(uid)
+    if not me:
+        await call.answer()
+        return
+
+    target_id = int(call.data.split(":")[2])
+    if int(me["superlikes"]) <= 0:
+        await call.answer("У тебя закончились Супер-письма!", show_alert=True)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💌 Купить 5 Супер-писем", callback_data="shop:buy:super_5")],
+                [InlineKeyboardButton(text="🎁 Получить бесплатно за друга", callback_data="ref:menu")],
+                [InlineKeyboardButton(text="⬅️ Вернуться к анкетам", callback_data="browse:next")],
+            ]
+        )
+        await send_screen(
+            bot,
+            uid,
+            "💌 <b>У тебя 0 Супер-писем!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Супер-письмо позволяет отправить личное сообщение и твой контакт любому человеку сразу, без ожидания взаимного лайка.\n\n"
+            "Пополни баланс в магазине или пригласи друга (за каждого друга даётся <b>+1 Супер-письмо</b> бесплатно)!",
+            reply_markup=kb,
+        )
+        return
+
+    await call.answer()
+    await state.set_state(SuperMsgForm.waiting_text)
+    await state.update_data(target_id=target_id)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Назад к анкетам", callback_data="browse:next"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
+            ]
+        ]
+    )
+    await send_screen(
+        bot,
+        uid,
+        f"💌 <b>Отправка Супер-письма (Доступно: {me['superlikes']} шт.)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Напиши в чат сообщение, которое мы мгновенно доставим этому пользователю вместе со ссылкой на твой профиль:",
+        reply_markup=kb,
+    )
+
+
+@router.message(SuperMsgForm.waiting_text)
+async def msg_super_send(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    if len(text) < 2 or len(text) > 400:
+        await send_screen(
+            bot,
+            uid,
+            "⚠️ <b>Сообщение должно быть от 2 до 400 символов.</b> Напиши ещё раз:",
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu:browse")]]
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="browse:next")]]
             ),
         )
         return
@@ -1971,254 +1863,277 @@ async def handle_super_msg(message: Message, state: FSMContext, bot: Bot) -> Non
     target_id = int(data.get("target_id", 0))
     await state.clear()
 
-    me = get_profile(message.from_user.id)
-    target = get_profile(target_id)
-    if not me or not target:
-        await render_next_candidate(bot, message.from_user.id)
+    me = db.get_profile(uid)
+    target = db.get_profile(target_id)
+    if not me or not target or not db.use_superlike(uid):
+        await render_home(bot, db, uid)
         return
 
-    if not use_superlike(message.from_user.id):
-        await render_shop_item(bot, message.from_user.id, "super_5")
-        return
-
-    add_reaction(message.from_user.id, target_id, "like")
-    my_link = (
-        f"@{me['username']}"
-        if me["username"]
-        else f"<a href='tg://user?id={message.from_user.id}'>{html.escape(me['name'])}</a>"
-    )
+    db.record_reaction(uid, target_id, "like")
+    my_link = f"@{me['username']}" if me["username"] else f"<a href='tg://user?id={uid}'>{me['name']}</a>"
 
     try:
         await bot.send_message(
             target_id,
-            f"💌 <b>Тебе пришло Супер-письмо!</b>\n\n"
-            f"От: <b>{html.escape(me['name'])}, {me['age']}</b> ({html.escape(me['city'])})\n"
-            f"<blockquote>{html.escape(text_msg)}</blockquote>\n"
-            f"👉 Ответить в ЛС: {my_link}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
+            f"💌 <b>Тебе пришло Супер-письмо!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"От: <b>{me['name']}</b> ({me['age']} лет, {me['city']})\n\n"
+            f"💬 <b>Сообщение:</b>\n"
+            f"<blockquote>{text}</blockquote>\n\n"
+            f"👉 Ответить лично: {my_link}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="❤️ Ответить взаимностью", callback_data=f"react:like:{uid}")],
+                    [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+                ]
+            ),
         )
     except Exception:
         pass
 
-    await render_next_candidate(
-        bot,
-        message.from_user.id,
-        prefix_notice=f"✅ <b>Супер-письмо для {html.escape(target['name'])} доставлено!</b>",
-    )
+    await show_next_candidate(bot, db, uid)
 
 
-# --- КТО МЕНЯ ЛАЙКНУЛ ---
-@dp.callback_query(F.data == "menu:who_liked")
-async def cb_who_liked(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    me = get_profile(user_id)
-    if not me:
-        await render_home(bot, user_id)
-        return
+# =========================
+# МЭТЧИ, ЖАЛОБЫ И НАСТРОЙКИ
+# =========================
+@router.callback_query(F.data == "matches:list")
+async def cb_matches_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    await call.answer()
+    uid = call.from_user.id
+    matches = db.list_matches(uid, limit=20)
 
-    incoming = get_incoming_likes(user_id)
-    if not incoming:
+    if not matches:
         text = (
-            "👀 <b>Новых входящих лайков пока нет</b>\n\n"
-            "💡 <i>Совет: подними анкету в ТОП или пригласи друзей, чтобы получать в 5 раз больше симпатий!</i>"
-        )
-        rows = []
-        if is_adult_age(int(me["age"])) and PAYMENTS_ENABLED:
-            rows.append([InlineKeyboardButton(text="🚀 Поднять анкету в ТОП", callback_data="shop:item:boost_24")])
-        rows.append([InlineKeyboardButton(text="🎁 Бесплатный VIP за друзей", callback_data="menu:referral")])
-        rows.append([vpn_button()])
-        rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")])
-        await send_screen(bot, user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-        return
-
-    adm = incoming[0]
-    viewer_vip = is_vip(me) or is_minor_age(int(me["age"]))
-
-    if viewer_vip:
-        title = f"😍 <b>Тебя лайкнули ({len(incoming)} чел.)!</b>"
-        caption = format_profile_card(adm, title=title)
-        await send_screen(
-            bot,
-            user_id,
-            caption,
-            reply_markup=who_liked_kb(int(adm["user_id"]), True),
-            photo_id=adm["photo_id"],
+            "💌 <b>У тебя пока нет взаимных симпатий (мэтчей).</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Ставь лайки в разделе «Смотреть анкеты», и как только симпатия совпадёт — здесь появится прямая ссылка на человека!"
         )
     else:
-        masked_name = html.escape(str(adm["name"])[:1]) + "***"
-        city = html.escape(str(adm["city"]))
-        text = (
-            f"🔥 <b>Твоя анкета понравилась {len(incoming)} чел.!</b>\n\n"
-            f"👤 <b>{masked_name}, {adm['age']}</b>  📍 <i>{city}</i>\n"
-            f"<blockquote>🔒 Фотография и контакты скрыты. Подключи VIP-статус (или пригласи 3 друзей бесплатно), чтобы сразу видеть всех, кто тебя лайкает!</blockquote>"
-        )
-        await send_screen(bot, user_id, text, reply_markup=who_liked_kb(int(adm["user_id"]), False))
+        lines = ["💌 <b>Твои взаимные симпатии:</b>\n━━━━━━━━━━━━━━━━━━━━"]
+        for m in matches:
+            link = f"@{m['username']}" if m["username"] else f"<a href='tg://user?id={m['user_id']}'>{m['name']}</a>"
+            lines.append(f"• <b>{m['name']}</b>, {m['age']} ({m['city']}) — {link}")
+        text = "\n".join(lines)
 
-
-@dp.callback_query(F.data == "menu:matches")
-async def cb_matches(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    rows = get_matches(user_id)
-
-    if not rows:
-        text = (
-            "💞 <b>У тебя пока нет взаимных симпатий</b>\n\n"
-            "Ставь лайки в разделе «🔥 Смотреть анкеты» — как только симпатия совпадет, здесь появится ссылка на профиль человека!"
-        )
-        await send_screen(bot, user_id, text, reply_markup=back_home_kb())
-        return
-
-    lines = ["💞 <b>Твои взаимные симпатии:</b>\n"]
-    for idx, r in enumerate(rows, start=1):
-        name = html.escape(str(r["name"]))
-        age = int(r["age"])
-        city = html.escape(str(r["city"]))
-        link = f"@{r['username']}" if r["username"] else f"<a href='tg://user?id={r['user_id']}'>Написать в ЛС</a>"
-        lines.append(f"{idx}. <b>{name}, {age}</b> ({city}) — {link}")
-
-    await send_screen(bot, user_id, "\n".join(lines), reply_markup=back_home_kb())
-
-
-# =========================
-# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ + ПОДТВЕРЖДЕНИЕ В 1 КЛИК)
-# =========================
-async def render_shop_item(
-    bot: Bot,
-    user_id: int,
-    product_code: str,
-    custom_notice: Optional[str] = None,
-) -> None:
-    me = get_profile(user_id)
-    if not me:
-        await render_home(bot, user_id)
-        return
-
-    if is_minor_age(int(me["age"])):
-        await render_home(bot, user_id, notice="🔒 <b>Платные услуги доступны только пользователям 18+.</b>")
-        return
-
-    prod = PRODUCTS.get(product_code)
-    if not prod:
-        await render_home(bot, user_id)
-        return
-
-    base_p, comm_p, total_p = calc_price_with_commission(prod.base_price_rub)
-    order_id = f"{product_code}_{user_id}_{uuid.uuid4().hex[:8]}"
-    create_order(order_id, user_id, product_code, base_p, comm_p, total_p, "RUB")
-
-    pay_url = generate_yoomoney_link(order_id, total_p, f"{prod.title} (ID {user_id})")
-
-    header = f"{custom_notice}\n\n" if custom_notice else ""
-    text = (
-        f"{header}"
-        f"{prod.emoji} <b>{prod.title}</b>\n\n"
-        f"<blockquote>{prod.description}</blockquote>\n\n"
-        f"💳 <b>Детали оплаты (ЮMoney / Банковская карта):</b>\n"
-        f"• Стоимость тарифа: <b>{base_p} ₽</b>\n"
-        f"• Сервисный сбор ({COMMISSION_PERCENT}%): <b>+{comm_p} ₽</b>\n"
-        f"• <b>Итого к оплате: {total_p} ₽</b>\n\n"
-        f"1️⃣ Нажми кнопку <b>«Оплатить через ЮMoney / Картой»</b>.\n"
-        f"2️⃣ После оплаты вернись сюда и нажми <b>«🔄 Проверить оплату»</b>!"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+            [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+            [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+        ]
     )
-
-    if not YOOMONEY_WALLET:
-        text += "\n\n⚠️ <i>Внимание администратору: укажите номер кошелька YOOMONEY_WALLET в файле .env!</i>"
-
-    await send_screen(
-        bot,
-        user_id,
-        text,
-        reply_markup=payment_invoice_kb(order_id, pay_url, product_code),
-    )
+    await send_screen(bot, uid, text, reply_markup=kb)
 
 
-@dp.callback_query(F.data == "menu:shop")
-async def cb_shop_menu(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    me = get_profile(callback.from_user.id)
-    if not me:
-        await render_home(bot, callback.from_user.id)
-        return
+@router.callback_query(F.data.startswith("safety:"))
+async def cb_safety(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    _, kind, raw_target = call.data.split(":", 2)
+    target_id = int(raw_target)
 
-    if is_minor_age(int(me["age"])):
-        await render_home(bot, callback.from_user.id, notice="🔒 <b>Магазин доступен только для категории 18+.</b>")
-        return
-
-    text = (
-        "👑 <b>Премиум-магазин и ускорение анкеты</b>\n\n"
-        "Выбери нужную привилегию, чтобы получать максимум внимания, видеть всех поклонников и писать первым без ожидания взаимного лайка:\n\n"
-        f"<i>Все платежи защищены и проходят через официальный шлюз ЮMoney (yoomoney.ru). Комиссия сервиса составляет {COMMISSION_PERCENT}%.</i>"
-    )
-    await send_screen(bot, callback.from_user.id, text, reply_markup=shop_menu_kb())
-
-
-@dp.callback_query(F.data.startswith("shop:item:"))
-async def cb_shop_item(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    product_code = callback.data.split(":")[2]
-    await render_shop_item(bot, callback.from_user.id, product_code)
-
-
-async def complete_and_reward_order(bot: Bot, order_id: str, charge_id: str) -> str:
-    """Помечает заказ оплаченным, выдает услугу покупателю и бонус его рефоводу."""
-    order = get_order(order_id)
-    if not order:
-        return "Заказ не найден"
-
-    mark_order_paid(order_id, charge_id)
-    prod_code = str(order["product"])
-    user_id = int(order["user_id"])
-
-    reward_msg = apply_order_reward(user_id, prod_code)
-
-    me = get_profile(user_id)
-    if me and int(me["referred_by"]) > 0:
-        inviter_id = int(me["referred_by"])
-        if get_profile(inviter_id):
-            add_vip_days(inviter_id, 1, bonus_superlikes=2)
+    if kind == "block":
+        db.block_user(uid, target_id)
+        db.record_reaction(uid, target_id, "skip")
+        await call.answer("Пользователь добавлен в ЧС 🚫")
+    elif kind == "report":
+        db.report_user(uid, target_id)
+        db.block_user(uid, target_id)
+        db.record_reaction(uid, target_id, "skip")
+        if ADMIN_ID > 0:
             try:
                 await bot.send_message(
-                    inviter_id,
-                    "💎 <b>Партнёрский бонус!</b>\n"
-                    "Приглашённый тобой друг совершил покупку в магазине — тебе начислено <b>+24 часа VIP 👑 и +2 Супер-письма 💌</b>!",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[vpn_button()]]),
+                    ADMIN_ID,
+                    f"⚠️ <b>Жалоба на анкету</b>\nОт: <code>{uid}</code>\nНа: <code>{target_id}</code>",
                 )
             except Exception:
                 pass
+        await call.answer("Жалоба отправлена модераторам ⚠️")
 
-    return reward_msg
+    await show_next_candidate(bot, db, uid)
 
 
-@dp.callback_query(F.data.startswith("pay:check:"))
-async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
-    order_id = callback.data.split(":")[2]
-    order = get_order(order_id)
-    if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
+@router.callback_query(F.data == "settings:open")
+async def cb_settings_open(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer()
+        await render_home(bot, db, uid)
+        return
+    await call.answer()
+    active = int(p["active"]) == 1
+    status_str = "🟢 Твоя анкета видна всем" if active else "⏸ Твоя анкета скрыта"
+    await send_screen(
+        bot,
+        uid,
+        f"⚙️ <b>Настройки профиля</b>\n━━━━━━━━━━━━━━━━━━━━\nТекущий статус: <b>{status_str}</b>",
+        reply_markup=kb_settings(active),
+    )
+
+
+@router.callback_query(F.data == "settings:toggle_active")
+async def cb_settings_toggle(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer()
+        return
+    new_active = not (int(p["active"]) == 1)
+    db.set_active(uid, new_active)
+    await call.answer("Статус анкеты изменён!")
+    status_str = "🟢 Твоя анкета видна всем" if new_active else "⏸ Твоя анкета скрыта"
+    await send_screen(
+        bot,
+        uid,
+        f"⚙️ <b>Настройки профиля</b>\n━━━━━━━━━━━━━━━━━━━━\nТекущий статус: <b>{status_str}</b>",
+        reply_markup=kb_settings(new_active),
+    )
+
+
+# =========================
+# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ)
+# =========================
+async def complete_and_reward_order(bot: Bot, db: Database, order: sqlite3.Row, charge_source: str) -> str:
+    uid = int(order["user_id"])
+    prod_key = str(order["product"])
+    db.mark_order_paid(str(order["order_id"]), charge_source)
+
+    if prod_key == "vip_7":
+        db.add_vip(uid, days=7, bonus_superlikes=3)
+        reward_text = "👑 <b>VIP-статус на 7 дней</b> и <b>+3 💌 Супер-письма</b> успешно начислены!"
+    elif prod_key == "vip_30":
+        db.add_vip(uid, days=30, bonus_superlikes=10)
+        reward_text = "👑 <b>VIP-статус на 30 дней</b> и <b>+10 💌 Супер-писем</b> успешно начислены!"
+    elif prod_key == "boost_24":
+        db.add_boost(uid, hours=24)
+        reward_text = "🚀 <b>ТОП-продвижение анкеты на 24 часа</b> успешно активировано!"
+    elif prod_key == "super_5":
+        db.add_superlikes(uid, count=5)
+        reward_text = "💌 <b>+5 Супер-писем</b> добавлены на твой баланс!"
+    elif prod_key == "reset_skips":
+        cnt = db.reset_user_skips(uid)
+        reward_text = f"🔄 <b>История пропусков очищена</b> (восстановлено анкет: {cnt})!"
+    else:
+        reward_text = "✅ <b>Услуга успешно активирована!</b>"
+
+    inviter_id = db.reward_inviter_on_purchase(uid)
+    if inviter_id:
+        try:
+            await bot.send_message(
+                inviter_id,
+                "💎 <b>Приглашённый тобой друг совершил покупку в магазине!</b>\n"
+                "🎁 Тебе начислен партнёрский бонус: <b>👑 +24 часа VIP-статуса</b> и <b>+2 💌 Супер-письма</b>!",
+            )
+        except Exception:
+            pass
+
+    return reward_text
+
+
+@router.callback_query(F.data == "shop:menu")
+async def cb_shop_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    me = db.get_profile(uid)
+    if not me or int(me["age"]) < 18:
+        await call.answer("Платные услуги доступны только пользователям 18+.", show_alert=True)
+        return
+
+    await call.answer()
+    text = (
+        "👑 <b>Магазин привилегий и VIP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Выдели свою анкету среди тысяч других, открой список всех, кто тебя лайкнул, и пиши любому человеку напрямую без ожидания взаимности!\n\n"
+        "💳 <b>Способ оплаты:</b> ЮMoney / Банковские карты РФ (Mir, Visa, Mastercard)\n"
+        f"ℹ️ <i>Цены указаны с учётом комиссии платёжного агрегатора ({COMMISSION_PERCENT}%).</i>\n\n"
+        "👇 <b>Выбери нужную привилегию:</b>"
+    )
+    await send_screen(bot, uid, text, reply_markup=kb_shop_menu())
+
+
+@router.callback_query(F.data.startswith("shop:buy:"))
+async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    me = db.get_profile(uid)
+    if not me or int(me["age"]) < 18:
+        await call.answer("Доступно только с 18 лет.", show_alert=True)
+        return
+
+    prod_key = call.data.split(":", 2)[2]
+    prod = PRODUCTS.get(prod_key)
+    if not prod:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+
+    await call.answer()
+    base_rub, comm_rub, total_rub = calc_price_with_commission(prod.base_price_rub)
+    order_id = f"ym_{uid}_{uuid.uuid4().hex[:10]}"
+
+    db.create_order(
+        order_id=order_id,
+        user_id=uid,
+        product=prod.key,
+        base_amount=base_rub,
+        commission=comm_rub,
+        total_amount=total_rub,
+    )
+
+    pay_url = create_yoomoney_pay_link(order_id, total_rub, f"{prod.title} (ID {uid})")
+
+    text = (
+        f"🧾 <b>Оформление заказа: {prod.title}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{prod.description}\n\n"
+        f"💰 <b>Стоимость тарифа:</b> {base_rub} ₽\n"
+        f"📊 <b>Комиссия сервиса ({COMMISSION_PERCENT}%):</b> +{comm_rub} ₽\n"
+        f"💳 <b>ИТОГО К ОПЛАТЕ: {total_rub} ₽</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"1️⃣ Нажми кнопку <b>«💳 Оплатить через ЮMoney»</b> ниже и заверши перевод.\n"
+        f"2️⃣ Сразу после оплаты вернись сюда и нажми <b>«🔄 Проверить оплату»</b> — привилегии выдадутся автоматически!"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {total_rub} ₽ через ЮMoney", url=pay_url)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"shop:check:{order_id}")],
+            [InlineKeyboardButton(text="🛠 Помощь / Написать в поддержку", url=SUPPORT_URL)],
+            [
+                InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop:menu"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
+            ],
+        ]
+    )
+    await send_screen(bot, uid, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("shop:check:"))
+async def cb_shop_check(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    order_id = call.data.split(":", 2)[2]
+    order = db.get_order(order_id)
+
+    if not order or int(order["user_id"]) != uid:
+        await call.answer("Заказ не найден.", show_alert=True)
         return
 
     if order["status"] == "paid":
-        await callback.answer("Этот заказ уже оплачен и активирован! 🎉", show_alert=True)
-        await render_home(bot, callback.from_user.id)
+        await call.answer("Этот заказ уже оплачен и активирован!", show_alert=True)
+        await render_home(bot, db, uid)
         return
 
-    ok, info, need_admin_manual = await verify_yoomoney_payment(order_id, int(order["amount"]))
-
-    if not ok:
-        # Если токен ЮMoney не настроен (401), отправляем заявку админу с кнопкой выдачи в 1 клик!
-        if need_admin_manual and ADMIN_ID:
+    paid, msg, need_admin_manual = await verify_yoomoney_payment(order_id, int(order["amount"]))
+    if not paid:
+        if need_admin_manual and ADMIN_ID > 0:
+            now = int(time.time())
             last_sent = admin_notified_orders.get(order_id, 0)
-            if now_ts() - last_sent > 60:
-                admin_notified_orders[order_id] = now_ts()
+            if now - last_sent >= 60:
+                admin_notified_orders[order_id] = now
                 prod = PRODUCTS.get(str(order["product"]))
                 prod_title = prod.title if prod else str(order["product"])
-                buyer_id = int(order["user_id"])
-                buyer_prof = get_profile(buyer_id)
-                buyer_name = html.escape(buyer_prof["name"]) if buyer_prof else str(buyer_id)
+                buyer = db.get_profile(uid)
+                buyer_info = f"{buyer['name']} (@{buyer['username'] or 'нет'})" if buyer else f"ID {uid}"
 
-                admin_kb = InlineKeyboardMarkup(
+                adm_kb = InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(
@@ -2237,105 +2152,370 @@ async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
                 try:
                     await bot.send_message(
                         ADMIN_ID,
-                        f"🔔 <b>Проверка оплаты заказа!</b>\n\n"
-                        f"👤 Покупатель: <b>{buyer_name}</b> (ID: <code>{buyer_id}</code>)\n"
+                        f"💳 <b>Запрос проверки оплаты ЮMoney</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 Покупатель: <b>{buyer_info}</b> (<code>{uid}</code>)\n"
                         f"📦 Услуга: <b>{prod_title}</b>\n"
-                        f"💰 Сумма к зачислению: <b>{order['amount']} ₽</b>\n"
-                        f"🏷 Метка заказа: <code>{order_id}</code>\n\n"
-                        f"<i>Проверьте поступление {order['amount']} ₽ в приложении ЮMoney и нажмите кнопку ниже, чтобы бот мгновенно выдал привилегию:</i>",
-                        reply_markup=admin_kb,
+                        f"💰 Сумма с комиссией: <b>{order['amount']} ₽</b>\n"
+                        f"🏷 Метка платежа: <code>{order_id}</code>\n\n"
+                        f"<i>Проверьте поступление в кошельке ЮMoney ({YOOMONEY_WALLET}) и нажмите кнопку ниже:</i>",
+                        reply_markup=adm_kb,
                     )
                 except Exception:
                     pass
 
-        await callback.answer(info, show_alert=True)
+        await call.answer(msg, show_alert=True)
         return
 
-    # Если автопроверка по API ЮMoney прошла успешно
-    reward_msg = await complete_and_reward_order(bot, order_id, info)
-
-    if ADMIN_ID:
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"💰 <b>Автоматическая оплата ЮMoney!</b>\n"
-                f"Пользователь: <code>{callback.from_user.id}</code>\n"
-                f"Услуга: <b>{order['product']}</b>\n"
-                f"Сумма: <b>{order['amount']} ₽</b> (вкл. комиссию {order['commission']} ₽)",
-            )
-        except Exception:
-            pass
-
-    await callback.answer("Оплата подтверждена! 🎉", show_alert=True)
-    await render_home(bot, callback.from_user.id, notice=reward_msg)
+    reward_text = await complete_and_reward_order(bot, db, order, f"yoomoney_{order_id}")
+    await call.answer("Оплата прошла успешно! 🎉", show_alert=True)
+    await send_screen(
+        bot,
+        uid,
+        f"🎉 <b>Спасибо за покупку!</b>\n━━━━━━━━━━━━━━━━━━━━\n{reward_text}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]
+        ),
+    )
 
 
-@dp.callback_query(F.data.startswith("adminpay:"))
-async def cb_admin_payment_decision(callback: CallbackQuery, bot: Bot) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Доступно только администратору", show_alert=True)
+@router.callback_query(F.data.startswith("adminpay:"))
+async def cb_admin_payment_decision(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Доступ запрещён", show_alert=True)
         return
 
-    parts = callback.data.split(":")
-    decision = parts[1]
-    order_id = parts[2]
-
-    order = get_order(order_id)
+    _, action, order_id = call.data.split(":", 2)
+    order = db.get_order(order_id)
     if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
+        await call.answer("Заказ не найден в БД", show_alert=True)
         return
 
     buyer_id = int(order["user_id"])
 
-    if decision == "approve":
-        if order["status"] == "paid":
-            await callback.answer("Заказ уже был подтвержден ранее!", show_alert=True)
-            return
+    if order["status"] == "paid":
+        await call.answer("Заказ уже был подтверждён ранее!", show_alert=True)
+        return
 
-        reward_msg = await complete_and_reward_order(bot, order_id, f"admin_approved_{now_ts()}")
-        await callback.answer("✅ Услуга успешно выдана покупателю!", show_alert=True)
-
+    if action == "approve":
+        reward_text = await complete_and_reward_order(bot, db, order, f"admin_approved_{order_id}")
+        await call.answer("Привилегия выдана пользователю! ✅", show_alert=True)
         try:
-            await callback.message.edit_text(
-                callback.message.html_text + "\n\n✅ <b>СТАТУС: ПОДТВЕРЖДЕНО И ВЫДАНО!</b>"
+            await call.message.edit_text(
+                f"{call.message.text}\n\n✅ <b>ПОДТВЕРЖДЕНО АДМИНИСТРАТОРОМ — ПРИВИЛЕГИИ ВЫДАНЫ</b>"
             )
         except Exception:
             pass
 
         try:
-            await render_home(bot, buyer_id, notice=f"🎉 <b>Твоя оплата подтверждена!</b>\n{reward_msg}")
+            await send_screen(
+                bot,
+                buyer_id,
+                f"🎉 <b>Твоя оплата подтверждена!</b>\n━━━━━━━━━━━━━━━━━━━━\n{reward_text}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+                    ]
+                ),
+            )
         except Exception:
             pass
 
-    elif decision == "reject":
-        await callback.answer("❌ Отклонено", show_alert=True)
+    elif action == "reject":
+        await call.answer("Отклонено ❌", show_alert=True)
         try:
-            await callback.message.edit_text(
-                callback.message.html_text + "\n\n❌ <b>СТАТУС: ОПЛАТА НЕ НАЙДЕНА</b>"
+            await call.message.edit_text(
+                f"{call.message.text}\n\n❌ <b>ОТКЛОНЕНО (ОПЛАТА НЕ ПОСТУПИЛА)</b>"
             )
         except Exception:
             pass
         try:
             await bot.send_message(
                 buyer_id,
-                "⚠️ <b>Платёж по твоему заказу пока не поступил на кошелёк ЮMoney.</b>\n"
-                "Если ты уже оплатил(а) заказ, напиши в поддержку /paysupport.",
+                f"⚠️ <b>Платёж по заказу <code>{order_id}</code> не найден.</b>\n"
+                f"Если вы уже совершили перевод, напишите напрямую в поддержку: {SUPPORT_URL}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="🛠 Написать в поддержку", url=SUPPORT_URL)]]
+                ),
             )
         except Exception:
             pass
 
 
-@dp.message()
-async def fallback_cleanup(message: Message, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
-    await render_home(bot, message.from_user.id)
+# =========================
+# ПОДДЕРЖКА И СООБЩЕНИЕ ОБ ОШИБКЕ (https://t.me/vladofix97)
+# =========================
+async def open_support_screen(bot: Bot, user_id: int) -> None:
+    text = (
+        "🆘 <b>Центр помощи и Поддержка «Лавчик»</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👨‍💻 <b>Официальная поддержка бота:</b> <a href='{SUPPORT_URL}'>{SUPPORT_USERNAME}</a>\n\n"
+        "• 🛠 <b>Заметили неисправность или ошибку в боте?</b>\n"
+        "Нажмите кнопку <b>«🛠 Сообщить об ошибке (@vladofix97)»</b> ниже и опишите проблему — мы оперативно всё исправим!\n\n"
+        "• 💳 <b>Вопрос по оплате или VIP-статусу?</b>\n"
+        "Напишите напрямую в поддержку или отправьте быстрый тикет прямо через бота 👇"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛠 Сообщить об ошибке / Неисправности", url=SUPPORT_URL)],
+            [InlineKeyboardButton(text="💬 Написать в поддержку (@vladofix97)", url=SUPPORT_URL)],
+            [InlineKeyboardButton(text="📝 Отправить обращение через бота", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="⭐️ Отзывы о боте", callback_data="reviews:menu")],
+            [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+        ]
+    )
+    await send_screen(bot, user_id, text, reply_markup=kb)
+
+
+@router.message(Command("paysupport"))
+async def cmd_paysupport(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await state.clear()
+    await open_support_screen(bot, message.from_user.id)
+
+
+@router.callback_query(F.data == "support:menu")
+async def cb_support_menu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    await call.answer()
+    await open_support_screen(bot, call.from_user.id)
+
+
+@router.callback_query(F.data == "support:ticket")
+async def cb_support_ticket(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    await state.set_state(SupportForm.waiting_text)
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "📝 <b>Отправка обращения в поддержку</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Опиши свой вопрос, проблему с оплатой или найденную ошибку одним сообщением и отправь в чат (или напиши напрямую "
+        f"<a href='{SUPPORT_URL}'>{SUPPORT_USERNAME}</a>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Открыть чат с @vladofix97", url=SUPPORT_URL)],
+                [
+                    InlineKeyboardButton(text="⬅️ Назад", callback_data="support:menu"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
+                ],
+            ]
+        ),
+    )
+
+
+@router.message(SupportForm.waiting_text)
+async def msg_support_send(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    await state.clear()
+
+    if ADMIN_ID > 0 and len(text) > 2:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🆘 <b>Обращение в поддержку</b>\n"
+                f"От: <code>{uid}</code> (@{message.from_user.username or 'нет'})\n\n"
+                f"<blockquote>{text}</blockquote>",
+            )
+        except Exception:
+            pass
+
+    await send_screen(
+        bot,
+        uid,
+        "✅ <b>Твоё обращение передано администратору!</b>\n"
+        f"Для максимально быстрого ответа ты также можешь написать напрямую: <a href='{SUPPORT_URL}'>{SUPPORT_USERNAME}</a>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Написать @vladofix97", url=SUPPORT_URL)],
+                [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:home")],
+            ]
+        ),
+    )
 
 
 # =========================
-# ФОНОВЫЙ HTTP-СЕРВЕР (ЗАЩИТА ОТ SIGTERM НА ХОСТИНГЕ)
+# АДМИН-ПАНЕЛЬ (/admin)
+# =========================
+async def render_admin_panel(bot: Bot, db: Database, user_id: int) -> None:
+    if user_id != ADMIN_ID:
+        return
+    stats = db.get_admin_stats()
+    ym_status = "🟢 Подключён (Авто-проверка)" if is_yoomoney_token_configured() else "🟡 Ручной режим (Кнопки в боте)"
+    text = (
+        "🛠 <b>Панель управления (Администратор)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Всего анкет в базе:</b> {stats['users']}\n"
+        f"🎁 <b>Пришло по рефералке:</b> {stats['refs']}\n"
+        f"👑 <b>Активных VIP:</b> {stats['vips']}\n"
+        f"⭐️ <b>Отзывов в боте:</b> {stats['reviews']}\n"
+        f"🧾 <b>Оплаченных заказов:</b> {stats['orders']}\n"
+        f"💰 <b>Общий оборот:</b> {stats['revenue']} ₽\n"
+        f"📈 <b>Чистая комиссия ({COMMISSION_PERCENT}%):</b> {stats['commission']} ₽\n"
+        f"💳 <b>Статус ЮMoney API:</b> {ym_status}\n"
+        f"🆘 <b>Контакт поддержки:</b> {SUPPORT_URL}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Сделать рассылку по базе", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(text="🎁 Выдать VIP на 7 дней по ID", callback_data="admin:gift_vip")],
+            [InlineKeyboardButton(text="⭐️ Управление отзывами", callback_data="reviews:menu")],
+            [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
+        ]
+    )
+    await send_screen(bot, user_id, text, reply_markup=kb)
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await render_admin_panel(bot, db, message.from_user.id)
+
+
+@router.callback_query(F.data == "admin:menu")
+async def cb_admin_menu(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    await state.clear()
+    await call.answer()
+    await render_admin_panel(bot, db, call.from_user.id)
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer()
+    await state.set_state(AdminForm.waiting_broadcast)
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "📢 <b>Массовая рассылка всем пользователям</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отправь текст рассылки (поддерживается HTML-разметка):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")]]
+        ),
+    )
+
+
+@router.message(AdminForm.waiting_broadcast)
+async def msg_admin_broadcast(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = (message.text or "").strip()
+    await state.clear()
+
+    users = db.get_all_user_ids()
+    sent = 0
+    for u in users:
+        try:
+            await bot.send_message(
+                u,
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                        [InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)],
+                    ]
+                ),
+            )
+            sent += 1
+            await asyncio.sleep(0.04)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
+        except Exception:
+            pass
+
+    await send_screen(
+        bot,
+        ADMIN_ID,
+        f"✅ <b>Рассылка завершена!</b>\nУспешно доставлено: <b>{sent}</b> из {len(users)} чел.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin:menu")]]
+        ),
+    )
+
+
+@router.callback_query(F.data == "admin:gift_vip")
+async def cb_admin_gift_vip(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer()
+    await state.set_state(AdminForm.waiting_gift_uid)
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "🎁 <b>Выдача VIP-статуса на 7 дней</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отправь Telegram ID пользователя числом:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")]]
+        ),
+    )
+
+
+@router.message(AdminForm.waiting_gift_uid)
+async def msg_admin_gift_uid(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw = (message.text or "").strip()
+    await state.clear()
+
+    if not raw.isdigit():
+        await render_admin_panel(bot, db, ADMIN_ID)
+        return
+
+    target_uid = int(raw)
+    p = db.get_profile(target_uid)
+    if not p:
+        await send_screen(
+            bot,
+            ADMIN_ID,
+            f"⚠️ Пользователь с ID <code>{target_uid}</code> не найден в базе анкет.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:menu")]]
+            ),
+        )
+        return
+
+    db.add_vip(target_uid, days=7, bonus_superlikes=3)
+    try:
+        await bot.send_message(
+            target_uid,
+            "🎁 <b>Администратор подарил тебе 👑 VIP-статус на 7 дней и +3 💌 Супер-письма!</b>",
+        )
+    except Exception:
+        pass
+
+    await send_screen(
+        bot,
+        ADMIN_ID,
+        f"✅ Пользователю <b>{p['name']}</b> (<code>{target_uid}</code>) выдан VIP на 7 дней!",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin:menu")]]
+        ),
+    )
+
+
+# Перехват любых случайных сообщений вне форм — удаляем и возвращаем чистое меню
+@router.message()
+async def fallback_cleanup(message: Message, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await render_home(bot, db, message.from_user.id)
+
+
+# =========================
+# HEALTH-CHECK ВЕБ-СЕРВЕР (ЧТОБЫ ХОСТИНГ НЕ ОСТАНАВЛИВАЛ БОТА SIGTERM)
 # =========================
 async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(text="OK - Lovchik Dating Bot is running")
+    return web.Response(text="Dating Bot is running OK!", status=200)
 
 
 async def start_dummy_webserver() -> web.AppRunner:
@@ -2347,49 +2527,56 @@ async def start_dummy_webserver() -> web.AppRunner:
     port = int(os.getenv("PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"🌐 Health-check веб-сервер запущен на порту {port} (защита от SIGTERM)")
+    logging.info(f"Health-check сервер запущен на порту {port}")
     return runner
 
 
 # =========================
-# ENTRYPOINT
+# ТОЧКА ВХОДА (MAIN)
 # =========================
 async def main() -> None:
     global BOT_USERNAME
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
-        logging.error("❌ ОШИБКА: BOT_TOKEN не задан или имеет неверный формат! Проверьте файл .env")
+        logging.error("КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не задан или имеет неверный формат в .env!")
         return
 
-    init_db()
-    web_runner = await start_dummy_webserver()
-
+    db = Database(DB_PATH)
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    dp = Dispatcher(storage=MemoryStorage())
+    dp["db"] = db
+    dp.include_router(router)
+
+    web_runner = await start_dummy_webserver()
 
     try:
         me = await bot.get_me()
-        if me.username:
-            BOT_USERNAME = me.username
-        logging.info(f"✅ Авторизация успешна: @{BOT_USERNAME} (ID: {me.id})")
+        BOT_USERNAME = me.username or "lovchik_tg_bot"
+        logging.info(f"Бот успешно авторизован: @{BOT_USERNAME} (ID: {me.id})")
 
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="🏠 Главное меню"),
-                BotCommand(command="paysupport", description="🛟 Поддержка по оплате"),
+                BotCommand(command="paysupport", description="🛠 Поддержка и сообщение об ошибке"),
             ]
         )
-        logging.info("🚀 Бот запущен и готов к работе!")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
     except TelegramUnauthorizedError:
         logging.error(
-            "❌ ОШИБКА АВТОРИЗАЦИИ (TelegramUnauthorizedError): Токен бота недействителен или отозван!\n"
-            "👉 Решение: Откройте @BotFather -> /mybots -> выберите бота -> API Token -> скопируйте новый токен в .env"
+            "КРИТИЧЕСКАЯ ОШИБКА: Токен бота недействителен (Unauthorized)! "
+            "Создайте новый токен в @BotFather и обновите BOT_TOKEN в .env."
         )
     finally:
-        await bot.session.close()
         await web_runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
