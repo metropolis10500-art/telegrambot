@@ -46,8 +46,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
 PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "1").strip() == "1"
 
 # Настройки ЮMoney (yoomoney.ru) и комиссии 30%
-YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "").strip()
-YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip()
+YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "").strip().strip('"').strip("'")
+YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
 COMMISSION_PERCENT = int(os.getenv("COMMISSION_PERCENT", "30").strip() or 30)
 
 # Партнерская кнопка Velvet VPN
@@ -62,6 +62,9 @@ BOT_USERNAME = "lovchik_tg_bot"
 
 # Хранилище последнего сообщения бота для каждого пользователя (для автоудаления)
 last_bot_messages: Dict[int, int] = {}
+
+# Защита от спама кнопкой "Проверить оплату" (order_id -> timestamp последнего уведомления админу)
+admin_notified_orders: Dict[str, int] = {}
 
 
 # =========================
@@ -167,7 +170,6 @@ def init_db() -> None:
     if "ref_count" not in p_cols:
         cur.execute("ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0")
 
-    # Таблица ожидания рефералов (до момента создания анкеты)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_referrals (
@@ -301,7 +303,6 @@ def get_profile(user_id: int) -> Optional[sqlite3.Row]:
 
 
 def save_pending_referral(user_id: int, inviter_id: int) -> bool:
-    """Сохраняет пригласившего для нового пользователя, пока он ещё не создал анкету."""
     if user_id == inviter_id or inviter_id <= 0:
         return False
     if get_profile(user_id) is not None:
@@ -333,10 +334,6 @@ def upsert_profile(
     bio: str,
     photo_id: Optional[str],
 ) -> Tuple[bool, Optional[int], int]:
-    """
-    Создает или обновляет анкету.
-    Возвращает (is_new_profile, inviter_id, inviter_new_ref_count).
-    """
     conn = db()
     cur = conn.cursor()
     existing = get_profile(user_id)
@@ -354,12 +351,10 @@ def upsert_profile(
         conn.close()
         return False, None, 0
 
-    # Проверяем, пришел ли пользователь по реферальной ссылке
     cur.execute("SELECT inviter_id FROM pending_referrals WHERE user_id = ?", (user_id,))
     pend = cur.fetchone()
     inviter_id = int(pend["inviter_id"]) if pend else 0
 
-    # Если пришел по рефке — даем 2 Супер-письма на старте вместо 1!
     initial_superlikes = 2 if inviter_id > 0 else 1
 
     cur.execute(
@@ -379,7 +374,6 @@ def upsert_profile(
     conn.commit()
     conn.close()
 
-    # Начисляем награду пригласившему
     if inviter_id > 0 and get_profile(inviter_id):
         conn2 = db()
         cur2 = conn2.cursor()
@@ -390,11 +384,9 @@ def upsert_profile(
         conn2.commit()
         conn2.close()
 
-        # Базовая награда за каждого друга: +1 Супер-письмо и +6 часов ТОП-буста
         add_superlikes(inviter_id, 1)
         add_boost_hours(inviter_id, 6)
 
-        # Каждые 3 приглашенных друга = +24 часа VIP-статуса!
         if new_ref_count % 3 == 0:
             add_vip_days(inviter_id, 1, bonus_superlikes=1)
 
@@ -716,6 +708,26 @@ def mark_order_paid(order_id: str, charge_id: str) -> None:
     conn.close()
 
 
+def apply_order_reward(user_id: int, prod_code: str) -> str:
+    """Начисляет привилегию пользователю и возвращает текст уведомления."""
+    if prod_code == "vip_7":
+        add_vip_days(user_id, 7, bonus_superlikes=3)
+        return "👑 <b>VIP-статус на 7 дней и +3 Супер-письма успешно активированы!</b>"
+    elif prod_code == "vip_30":
+        add_vip_days(user_id, 30, bonus_superlikes=10)
+        return "💎 <b>VIP-статус на 30 дней и +10 Супер-писем успешно активированы!</b>"
+    elif prod_code == "boost_24":
+        add_boost_hours(user_id, 24)
+        return "🚀 <b>Твоя анкета поднята в ТОП на 24 часа!</b>"
+    elif prod_code == "super_5":
+        add_superlikes(user_id, 5)
+        return "💌 <b>Тебе начислено +5 Супер-писем!</b>"
+    elif prod_code == "reset_skips":
+        reset_user_skips(user_id)
+        return "🔄 <b>Все пропущенные анкеты возвращены в поиск!</b>"
+    return "✅ <b>Оплата прошла успешно! Услуга активирована.</b>"
+
+
 def get_next_candidate(user_id: int) -> Optional[sqlite3.Row]:
     me = get_profile(user_id)
     if not me:
@@ -777,9 +789,18 @@ def generate_yoomoney_link(order_id: str, total_rub: int, description: str) -> s
     return f"https://yoomoney.ru/quickpay/confirm?{urlencode(params)}"
 
 
-async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str]:
-    if not YOOMONEY_TOKEN:
-        return False, "Токен ЮMoney (YOOMONEY_TOKEN) ещё не настроен в файле .env"
+async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str, bool]:
+    """
+    Проверяет оплату по API ЮMoney.
+    Возвращает: (оплачено_ли, сообщение_для_пользователя, нужен_ли_ручной_режим_админа)
+    """
+    # Если токен не задан или оставлена заглушка из примера
+    if not YOOMONEY_TOKEN or "ваш_" in YOOMONEY_TOKEN.lower() or len(YOOMONEY_TOKEN) < 20:
+        return (
+            False,
+            "⏳ Платёж проверяется! Если вы ещё не оплатили — нажмите «Оплатить» выше. Если уже перевели — заявка отправлена администратору, услуга активируется в ближайшее время!",
+            True,
+        )
 
     url = "https://yoomoney.ru/api/operation-history"
     headers = {
@@ -788,14 +809,25 @@ async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[b
     }
     data = {
         "label": order_id,
-        "records": "5",
+        "records": "10",
     }
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, data=data, timeout=10) as resp:
+                if resp.status == 401:
+                    logging.warning("ЮMoney вернул 401 Unauthorized: неверный YOOMONEY_TOKEN в .env. Переключаемся на подтверждение админом.")
+                    return (
+                        False,
+                        "⏳ Заявка на проверку оплаты отправлена! Если вы ещё не оплатили счёт — нажмите кнопку оплаты выше. После перевода услуга будет начислена!",
+                        True,
+                    )
                 if resp.status != 200:
-                    return False, f"Ошибка подключения к ЮMoney (код {resp.status})"
+                    return (
+                        False,
+                        "⏳ Платёж ещё в обработке. Подождите 15 секунд и нажмите «Проверить оплату» снова.",
+                        True,
+                    )
                 result = await resp.json()
                 operations = result.get("operations", [])
                 for op in operations:
@@ -806,14 +838,19 @@ async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[b
                     ):
                         op_amount = float(op.get("amount", 0))
                         if op_amount >= expected_total * 0.95:
-                            return True, str(op.get("operation_id", "yoomoney_paid"))
+                            return True, str(op.get("operation_id", "yoomoney_paid")), False
                 return (
                     False,
-                    "Платеж еще не поступил или находится в обработке. Подождите 10–15 секунд и нажмите «Проверить оплату» снова.",
+                    "⏳ Оплата по этому счёту ещё не поступила. Сначала оплатите по кнопке выше, подождите 10–15 секунд и нажмите «Проверить оплату».",
+                    False,
                 )
     except Exception as e:
         logging.error(f"YooMoney check error: {e}")
-        return False, "Временная ошибка соединения с сервером ЮMoney. Попробуйте через пару секунд."
+        return (
+            False,
+            "⏳ Проверка платежа... Если вы уже оплатили, заявка передана администратору!",
+            True,
+        )
 
 
 # =========================
@@ -1296,7 +1333,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
     user_id = message.from_user.id
     args = (command.args or "").strip()
 
-    # Обработка реферальной ссылки вида ?start=ref_123456
     ref_notice = None
     if args.startswith("ref_"):
         raw_inv = args.replace("ref_", "").strip()
@@ -1374,6 +1410,8 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
     total_comm = int(ord_row["comm"])
     conn.close()
 
+    token_ok = bool(YOOMONEY_TOKEN and "ваш_" not in YOOMONEY_TOKEN.lower() and len(YOOMONEY_TOKEN) >= 20)
+
     text = (
         "👑 <b>Панель управления и Монетизации</b>\n\n"
         f"👥 Всего анкет в базе: <b>{total_users}</b>\n"
@@ -1383,7 +1421,7 @@ async def cmd_admin(message: Message, state: FSMContext, bot: Bot) -> None:
         f"💰 Общий оборот: <b>{total_rev} ₽</b>\n"
         f"📈 Чистая комиссия ({COMMISSION_PERCENT}%): <b>{total_comm} ₽</b>\n\n"
         f"👛 Кошелек ЮMoney: <code>{YOOMONEY_WALLET or 'Не задан в .env'}</code>\n"
-        f"🔑 API Токен ЮMoney: <b>{'Подключен ✅' if YOOMONEY_TOKEN else 'Не задан в .env ❌'}</b>"
+        f"🔑 Режим проверки оплат: <b>{'Авто (API) + Ручной ✅' if token_ok else 'Подтверждение в 1 клик в боте ✅'}</b>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2044,7 +2082,7 @@ async def cb_matches(callback: CallbackQuery, bot: Bot) -> None:
 
 
 # =========================
-# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ + БОНУС РЕФОВОДУ)
+# МАГАЗИН И ОПЛАТА ЮMONEY (+30% КОМИССИЯ + ПОДТВЕРЖДЕНИЕ В 1 КЛИК)
 # =========================
 async def render_shop_item(
     bot: Bot,
@@ -2082,7 +2120,7 @@ async def render_shop_item(
         f"• Сервисный сбор ({COMMISSION_PERCENT}%): <b>+{comm_p} ₽</b>\n"
         f"• <b>Итого к оплате: {total_p} ₽</b>\n\n"
         f"1️⃣ Нажми кнопку <b>«Оплатить через ЮMoney / Картой»</b>.\n"
-        f"2️⃣ После оплаты вернись сюда и нажми <b>«🔄 Проверить оплату»</b> — услуга активируется автоматически!"
+        f"2️⃣ После оплаты вернись сюда и нажми <b>«🔄 Проверить оплату»</b>!"
     )
 
     if not YOOMONEY_WALLET:
@@ -2123,47 +2161,18 @@ async def cb_shop_item(callback: CallbackQuery, bot: Bot) -> None:
     await render_shop_item(bot, callback.from_user.id, product_code)
 
 
-@dp.callback_query(F.data.startswith("pay:check:"))
-async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
-    order_id = callback.data.split(":")[2]
+async def complete_and_reward_order(bot: Bot, order_id: str, charge_id: str) -> str:
+    """Помечает заказ оплаченным, выдает услугу покупателю и бонус его рефоводу."""
     order = get_order(order_id)
     if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
+        return "Заказ не найден"
 
-    if order["status"] == "paid":
-        await callback.answer("Этот заказ уже оплачен и активирован!", show_alert=True)
-        await render_home(bot, callback.from_user.id)
-        return
-
-    ok, info = await verify_yoomoney_payment(order_id, int(order["amount"]))
-    if not ok:
-        await callback.answer(info, show_alert=True)
-        return
-
-    mark_order_paid(order_id, info)
+    mark_order_paid(order_id, charge_id)
     prod_code = str(order["product"])
-    user_id = callback.from_user.id
+    user_id = int(order["user_id"])
 
-    if prod_code == "vip_7":
-        add_vip_days(user_id, 7, bonus_superlikes=3)
-        reward_msg = "👑 <b>VIP-статус на 7 дней и +3 Супер-письма успешно активированы!</b>"
-    elif prod_code == "vip_30":
-        add_vip_days(user_id, 30, bonus_superlikes=10)
-        reward_msg = "💎 <b>VIP-статус на 30 дней и +10 Супер-писем успешно активированы!</b>"
-    elif prod_code == "boost_24":
-        add_boost_hours(user_id, 24)
-        reward_msg = "🚀 <b>Твоя анкета поднята в ТОП на 24 часа!</b>"
-    elif prod_code == "super_5":
-        add_superlikes(user_id, 5)
-        reward_msg = "💌 <b>Тебе начислено +5 Супер-писем!</b>"
-    elif prod_code == "reset_skips":
-        reset_user_skips(user_id)
-        reward_msg = "🔄 <b>Все пропущенные анкеты возвращены в поиск!</b>"
-    else:
-        reward_msg = "✅ <b>Оплата прошла успешно!</b>"
+    reward_msg = apply_order_reward(user_id, prod_code)
 
-    # Начисляем реферальный бонус пригласившему за покупку друга (+24ч VIP и +2 Супер-письма)
     me = get_profile(user_id)
     if me and int(me["referred_by"]) > 0:
         inviter_id = int(me["referred_by"])
@@ -2179,20 +2188,141 @@ async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
             except Exception:
                 pass
 
+    return reward_msg
+
+
+@dp.callback_query(F.data.startswith("pay:check:"))
+async def cb_pay_check(callback: CallbackQuery, bot: Bot) -> None:
+    order_id = callback.data.split(":")[2]
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    if order["status"] == "paid":
+        await callback.answer("Этот заказ уже оплачен и активирован! 🎉", show_alert=True)
+        await render_home(bot, callback.from_user.id)
+        return
+
+    ok, info, need_admin_manual = await verify_yoomoney_payment(order_id, int(order["amount"]))
+
+    if not ok:
+        # Если токен ЮMoney не настроен (401), отправляем заявку админу с кнопкой выдачи в 1 клик!
+        if need_admin_manual and ADMIN_ID:
+            last_sent = admin_notified_orders.get(order_id, 0)
+            if now_ts() - last_sent > 60:
+                admin_notified_orders[order_id] = now_ts()
+                prod = PRODUCTS.get(str(order["product"]))
+                prod_title = prod.title if prod else str(order["product"])
+                buyer_id = int(order["user_id"])
+                buyer_prof = get_profile(buyer_id)
+                buyer_name = html.escape(buyer_prof["name"]) if buyer_prof else str(buyer_id)
+
+                admin_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=f"✅ Подтвердить ({order['amount']} ₽) и выдать",
+                                callback_data=f"adminpay:approve:{order_id}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="❌ Оплата не поступила",
+                                callback_data=f"adminpay:reject:{order_id}",
+                            )
+                        ],
+                    ]
+                )
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"🔔 <b>Проверка оплаты заказа!</b>\n\n"
+                        f"👤 Покупатель: <b>{buyer_name}</b> (ID: <code>{buyer_id}</code>)\n"
+                        f"📦 Услуга: <b>{prod_title}</b>\n"
+                        f"💰 Сумма к зачислению: <b>{order['amount']} ₽</b>\n"
+                        f"🏷 Метка заказа: <code>{order_id}</code>\n\n"
+                        f"<i>Проверьте поступление {order['amount']} ₽ в приложении ЮMoney и нажмите кнопку ниже, чтобы бот мгновенно выдал привилегию:</i>",
+                        reply_markup=admin_kb,
+                    )
+                except Exception:
+                    pass
+
+        await callback.answer(info, show_alert=True)
+        return
+
+    # Если автопроверка по API ЮMoney прошла успешно
+    reward_msg = await complete_and_reward_order(bot, order_id, info)
+
     if ADMIN_ID:
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"💰 <b>Новая оплата ЮMoney!</b>\n"
-                f"Пользователь: <code>{user_id}</code>\n"
-                f"Услуга: <b>{prod_code}</b>\n"
+                f"💰 <b>Автоматическая оплата ЮMoney!</b>\n"
+                f"Пользователь: <code>{callback.from_user.id}</code>\n"
+                f"Услуга: <b>{order['product']}</b>\n"
                 f"Сумма: <b>{order['amount']} ₽</b> (вкл. комиссию {order['commission']} ₽)",
             )
         except Exception:
             pass
 
     await callback.answer("Оплата подтверждена! 🎉", show_alert=True)
-    await render_home(bot, user_id, notice=reward_msg)
+    await render_home(bot, callback.from_user.id, notice=reward_msg)
+
+
+@dp.callback_query(F.data.startswith("adminpay:"))
+async def cb_admin_payment_decision(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Доступно только администратору", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    decision = parts[1]
+    order_id = parts[2]
+
+    order = get_order(order_id)
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    buyer_id = int(order["user_id"])
+
+    if decision == "approve":
+        if order["status"] == "paid":
+            await callback.answer("Заказ уже был подтвержден ранее!", show_alert=True)
+            return
+
+        reward_msg = await complete_and_reward_order(bot, order_id, f"admin_approved_{now_ts()}")
+        await callback.answer("✅ Услуга успешно выдана покупателю!", show_alert=True)
+
+        try:
+            await callback.message.edit_text(
+                callback.message.html_text + "\n\n✅ <b>СТАТУС: ПОДТВЕРЖДЕНО И ВЫДАНО!</b>"
+            )
+        except Exception:
+            pass
+
+        try:
+            await render_home(bot, buyer_id, notice=f"🎉 <b>Твоя оплата подтверждена!</b>\n{reward_msg}")
+        except Exception:
+            pass
+
+    elif decision == "reject":
+        await callback.answer("❌ Отклонено", show_alert=True)
+        try:
+            await callback.message.edit_text(
+                callback.message.html_text + "\n\n❌ <b>СТАТУС: ОПЛАТА НЕ НАЙДЕНА</b>"
+            )
+        except Exception:
+            pass
+        try:
+            await bot.send_message(
+                buyer_id,
+                "⚠️ <b>Платёж по твоему заказу пока не поступил на кошелёк ЮMoney.</b>\n"
+                "Если ты уже оплатил(а) заказ, напиши в поддержку /paysupport.",
+            )
+        except Exception:
+            pass
 
 
 @dp.message()
