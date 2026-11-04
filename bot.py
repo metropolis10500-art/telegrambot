@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import sqlite3
+from urllib.parse import urlencode
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,36 +19,44 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice,
     Message,
-    PreCheckoutQuery,
 )
+import aiohttp
 from dotenv import load_dotenv
 
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ И КОНСТАНТЫ
 # ============================================================
-# override=True заставляет брать свежие данные из .env, даже если хостинг закешировал старые
 load_dotenv(override=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 DB_PATH = os.getenv("DB_PATH", "dating_bot.sqlite3").strip()
-BOOST_PRICE_STARS = int(os.getenv("BOOST_PRICE_STARS", "25").strip() or "25")
+
 PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "0").strip() == "1"
+BOOST_PRICE_RUB = int(os.getenv("BOOST_PRICE_RUB", "99").strip() or "99")
+YOOMONEY_WALLET = (
+    os.getenv("YOOMONEY_WALLET", "").strip().strip('"').strip("'")
+)
+YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
+
+# Партнёрская кнопка Velvet VPN
+VPN_BUTTON_TEXT = "💎 Velvet VPN › Доступно всё"
+VPN_BUTTON_URL = "https://t.me/velvet?start=3SLkWOoF"
+VPN_BUTTON = (VPN_BUTTON_TEXT, VPN_BUTTON_URL)
 
 if (
     not BOT_TOKEN
     or ":" not in BOT_TOKEN
     or "НОВЫЙ_ТОКЕН" in BOT_TOKEN
-    or "вставь_сюда" in BOT_TOKEN
+    or "ВАШ_ТОКЕН" in BOT_TOKEN
 ):
-    raise SystemExit(
-        "❌ ОШИБКА: Укажи настоящий BOT_TOKEN от @BotFather в файле .env или настройках хостинга!"
-    )
+    raise SystemExit("❌ ОШИБКА: Укажи настоящий BOT_TOKEN в файле .env")
 
-if BOOST_PRICE_STARS < 1:
-    raise SystemExit("❌ ОШИБКА: BOOST_PRICE_STARS должен быть больше нуля")
+if BOOST_PRICE_RUB < 2:
+    raise SystemExit(
+        "❌ ОШИБКА: Минимальная сумма перевода в ЮMoney — 2 рубля (BOOST_PRICE_RUB >= 2)"
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,7 +137,6 @@ db.executescript(
     """
 )
 
-# Автоматическое добавление новых колонок, если база осталась от старой версии
 existing_columns = {
     row["name"] for row in db.execute("PRAGMA table_info(profiles)").fetchall()
 }
@@ -140,7 +148,7 @@ db.commit()
 
 
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И КЛАВИАТУРЫ
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -158,26 +166,33 @@ def get_profile(user_id: int):
 
 
 def buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=text, callback_data=data)
-                for text, data in row
-            ]
-            for row in rows
-        ]
-    )
+    """Универсальный генератор красивых кнопок.
+
+    Если второй параметр начинается с http:// или https:// — создаёт
+    URL-кнопку.
+    """
+    keyboard = []
+    for row in rows:
+        kb_row = []
+        for text, action in row:
+            if action.startswith(("http://", "https://")):
+                kb_row.append(InlineKeyboardButton(text=text, url=action))
+            else:
+                kb_row.append(
+                    InlineKeyboardButton(text=text, callback_data=action)
+                )
+        keyboard.append(kb_row)
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def main_menu() -> InlineKeyboardMarkup:
     return buttons(
         [
-            [("🔎 Смотреть анкеты", "browse")],
-            [("👤 Моя анкета", "my_profile")],
-            [("❤️ Взаимные симпатии", "matches")],
-            [("🚀 Поднять анкету", "boost")],
+            [("🔥 Смотреть анкеты", "browse")],
+            [("👤 Моя анкета", "my_profile"), ("💌 Симпатии", "matches")],
+            [("🚀 Поднять в ТОП", "boost"), ("⚙️ Настройки", "settings")],
             [("🛡 Безопасность", "safety")],
-            [("⚙️ Настройки", "settings")],
+            [VPN_BUTTON],
         ]
     )
 
@@ -187,13 +202,14 @@ def candidate_menu(target_id: int) -> InlineKeyboardMarkup:
         [
             [
                 ("❤️ Нравится", f"like:{target_id}"),
-                ("⏭ Пропустить", f"skip:{target_id}"),
+                ("⏭ Следующая", f"skip:{target_id}"),
             ],
             [
                 ("🚩 Жалоба", f"report:{target_id}"),
-                ("⛔ Блокировка", f"block:{target_id}"),
+                ("⛔ В ЧС", f"block:{target_id}"),
             ],
-            [("🏠 Главное меню", "menu")],
+            [VPN_BUTTON],
+            [("🏠 В главное меню", "menu")],
         ]
     )
 
@@ -202,21 +218,20 @@ def profile_text(profile: sqlite3.Row) -> str:
     name = html.escape(profile["name"])
     city = html.escape(profile["city"])
     bio = html.escape(profile["bio"])
-    boost_badge = (
-        " ⚡"
-        if profile["boost_until"] > int(datetime.now(timezone.utc).timestamp())
-        else ""
+    is_boosted = profile["boost_until"] > int(
+        datetime.now(timezone.utc).timestamp()
     )
+    boost_badge = "  ⚡️ <b>TOP</b>" if is_boosted else ""
     return (
-        f"👤 <b>{name}</b>, {profile['age']}{boost_badge}\n"
-        f"📍 {city}\n\n"
-        f"📝 {bio}"
+        f"👤 <b>{name}, {profile['age']}</b>{boost_badge}\n"
+        f"📍 <i>г. {city}</i>\n\n"
+        f"<blockquote>💬 {bio}</blockquote>"
     )
 
 
 def user_contact_link(profile: sqlite3.Row) -> str:
     name = html.escape(profile["name"])
-    link = f'<a href="tg://user?id={profile["user_id"]}">{name}</a>'
+    link = f'<a href="tg://user?id={profile["user_id"]}"><b>{name}</b></a>'
     if profile["username"]:
         return f"{link} (@{html.escape(profile['username'])})"
     return link
@@ -284,6 +299,63 @@ async def notify_admin(bot: Bot, text: str):
 
 
 # ============================================================
+# ФУНКЦИИ ОПЛАТЫ YOOMONEY (ЮMONEY)
+# ============================================================
+def build_yoomoney_url(order_id: str, amount_rub: int) -> str:
+    params = {
+        "receiver": YOOMONEY_WALLET,
+        "quickpay-form": "button",
+        "paymentType": "AC",
+        "sum": str(amount_rub),
+        "label": order_id,
+        "targets": f"Поднятие анкеты на 24 часа (#{order_id[:8]})",
+    }
+    return f"https://yoomoney.ru/quickpay/confirm?{urlencode(params)}"
+
+
+async def verify_yoomoney_payment(
+    order_id: str, expected_amount: int
+) -> str | None:
+    url = "https://yoomoney.ru/api/operation-history"
+    headers = {
+        "Authorization": f"Bearer {YOOMONEY_TOKEN}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {
+        "label": order_id,
+        "records": "5",
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, data=data) as resp:
+                if resp.status != 200:
+                    logging.error("Ошибка ответа ЮMoney API: %s", resp.status)
+                    return None
+                result = await resp.json()
+    except Exception:
+        logging.exception("Ошибка при подключении к ЮMoney API")
+        return None
+
+    if "error" in result:
+        logging.error("Ошибка ЮMoney API: %s", result["error"])
+        return None
+
+    for op in result.get("operations", []):
+        amount_received = float(op.get("amount", 0))
+        if (
+            op.get("status") == "success"
+            and op.get("direction") == "in"
+            and op.get("label") == order_id
+            and amount_received >= expected_amount * 0.95
+        ):
+            return str(op.get("operation_id"))
+
+    return None
+
+
+# ============================================================
 # СОСТОЯНИЯ (FSM)
 # ============================================================
 class ProfileForm(StatesGroup):
@@ -312,25 +384,36 @@ async def start(message: Message, state: FSMContext):
                 (message.from_user.username, message.from_user.id),
             )
             db.commit()
+        name = html.escape(profile["name"])
         await message.answer(
-            "👋 С возвращением!\n\nВыбери действие:",
+            f"✨ <b>С возвращением, {name}!</b>\n\n"
+            "Готов(а) к новым знакомствам? Выбирай нужный раздел в меню ниже 👇",
             reply_markup=main_menu(),
         )
         return
 
     await message.answer(
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "Здесь можно создать анкету и находить людей по взаимной симпатии.\n\n"
-        "🔒 Пользователи 14–17 лет и взрослые (18+) строго разделены.\n\n"
-        "Чтобы начать, создай анкету:",
-        reply_markup=buttons([[("✨ Создать анкету", "profile:create")]]),
+        "💘 <b>Добро пожаловать в бот знакомств!</b>\n\n"
+        "Здесь ты можешь найти новых друзей, компанию для прогулок или свою вторую половинку.\n\n"
+        "<blockquote>"
+        "✨ Быстрое создание анкеты за 1 минуту\n"
+        "💌 Открытие контактов только при взаимной симпатии\n"
+        "🔒 Безопасность: подростки (14–17) и взрослые (18+) разделены"
+        "</blockquote>\n\n"
+        "Нажми кнопку ниже, чтобы начать:",
+        reply_markup=buttons(
+            [
+                [("✨ Создать анкету", "profile:create")],
+                [VPN_BUTTON],
+            ]
+        ),
     )
 
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Действие отменено.", reply_markup=main_menu())
+    await message.answer("↩️ Действие отменено.", reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "profile:create")
@@ -339,9 +422,9 @@ async def create_profile(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ProfileForm.name)
     await callback.answer()
     await callback.message.answer(
-        "✨ <b>Создадим анкету!</b>\n\n"
-        "Как тебя называть? Напиши имя (от 2 до 30 символов).\n"
-        "Для отмены отправь /cancel."
+        "✨ <b>Шаг 1 из 5 — Имя</b>\n\n"
+        "Как тебя называть? Напиши своё имя (от 2 до 30 символов).\n\n"
+        "<i>Для отмены в любой момент отправь /cancel</i>"
     )
 
 
@@ -349,35 +432,41 @@ async def create_profile(callback: CallbackQuery, state: FSMContext):
 async def form_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not 2 <= len(name) <= 30:
-        await message.answer("Имя должно содержать от 2 до 30 символов.")
+        await message.answer("⚠️ Имя должно содержать от 2 до 30 символов.")
         return
     await state.update_data(name=name)
     await state.set_state(ProfileForm.age)
-    await message.answer("🎂 Сколько тебе лет? (Введи число от 14 до 80)")
+    await message.answer(
+        "🎂 <b>Шаг 2 из 5 — Возраст</b>\n\n"
+        "Сколько тебе лет? Введи число от <b>14</b> до <b>80</b>."
+    )
 
 
 @dp.message(ProfileForm.age)
 async def form_age(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if not text.isdigit() or not 14 <= int(text) <= 80:
-        await message.answer("Введи корректный возраст числом от 14 до 80.")
+        await message.answer("⚠️ Введи корректный возраст числом от 14 до 80.")
         return
     await state.update_data(age=int(text))
     await state.set_state(ProfileForm.city)
-    await message.answer("📍 В каком городе ты живёшь?")
+    await message.answer(
+        "📍 <b>Шаг 3 из 5 — Город</b>\n\nВ каком городе ты живёшь?"
+    )
 
 
 @dp.message(ProfileForm.city)
 async def form_city(message: Message, state: FSMContext):
     city = (message.text or "").strip()
     if not 2 <= len(city) <= 50:
-        await message.answer("Название города: от 2 до 50 символов.")
+        await message.answer("⚠️ Название города: от 2 до 50 символов.")
         return
     await state.update_data(city=city)
     await state.set_state(ProfileForm.bio)
     await message.answer(
-        "📝 Расскажи немного о себе и своих интересах (от 5 до 300 символов).\n"
-        "<i>Не указывай в тексте личный телефон или домашний адрес.</i>"
+        "📝 <b>Шаг 4 из 5 — О себе</b>\n\n"
+        "Расскажи немного о своих увлечениях, интересах и кого хочешь найти (от 5 до 300 символов).\n\n"
+        "<i>🔒 Не указывай номер телефона или домашний адрес в открытом описании.</i>"
     )
 
 
@@ -385,13 +474,16 @@ async def form_city(message: Message, state: FSMContext):
 async def form_bio(message: Message, state: FSMContext):
     bio = (message.text or "").strip()
     if not 5 <= len(bio) <= 300:
-        await message.answer("Описание должно содержать от 5 до 300 символов.")
+        await message.answer(
+            "⚠️ Описание должно содержать от 5 до 300 символов."
+        )
         return
     await state.update_data(bio=bio)
     await state.set_state(ProfileForm.photo)
     await message.answer(
-        "📸 <b>Отправь своё фото для анкеты</b>\n\n"
-        "Или нажми кнопку ниже, если хочешь анкету без фотографии:",
+        "📸 <b>Шаг 5 из 5 — Фотография</b>\n\n"
+        "Отправь своё лучшее фото! Анкеты с фотографией получают в 5 раз больше симпатий.\n\n"
+        "<i>Или нажми кнопку ниже, чтобы продолжить без фото:</i>",
         reply_markup=buttons([[("⏭ Пропустить фото", "profile:skip_photo")]]),
     )
 
@@ -448,7 +540,7 @@ async def finish_profile_saving(
         message,
         profile,
         reply_markup=main_menu(),
-        extra_text="✅ <b>Анкета успешно сохранена!</b>",
+        extra_text="✅ <b>Твоя анкета готова и опубликована!</b>",
     )
 
 
@@ -470,7 +562,7 @@ async def form_photo_skipped(callback: CallbackQuery, state: FSMContext):
 @dp.message(ProfileForm.photo)
 async def form_photo_invalid(message: Message):
     await message.answer(
-        "Пожалуйста, отправь фотографию (как картинку, а не файл) или нажми кнопку «Пропустить фото»."
+        "📸 Пожалуйста, отправь фотографию (как картинку, а не документ) или нажми кнопку «Пропустить фото»."
     )
 
 
@@ -481,13 +573,16 @@ async def show_candidate(message: Message, viewer_id: int):
     viewer = get_profile(viewer_id)
     if not viewer:
         await message.answer(
-            "Сначала создай анкету.",
-            reply_markup=buttons([[("✨ Создать анкету", "profile:create")]]),
+            "Сначала создай свою анкету!",
+            reply_markup=buttons(
+                [[("✨ Создать анкету", "profile:create")], [VPN_BUTTON]]
+            ),
         )
         return
     if not viewer["active"]:
         await message.answer(
-            "Твоя анкета скрыта. Включи её в настройках, чтобы смотреть других.",
+            "🙈 <b>Твоя анкета сейчас скрыта.</b>\n"
+            "Включи показ анкеты в настройках, чтобы смотреть других пользователей.",
             reply_markup=main_menu(),
         )
         return
@@ -521,7 +616,9 @@ async def show_candidate(message: Message, viewer_id: int):
 
     if not candidate:
         await message.answer(
-            "😔 Пока новых анкет нет. Загляни чуть позже!",
+            "✨ <b>Ты посмотрел(а) все доступные анкеты!</b>\n\n"
+            "Загляни сюда чуть позже — скоро появятся новые люди. "
+            "А чтобы тебя заметили первым, можешь поднять свою анкету в ТОП 🚀",
             reply_markup=main_menu(),
         )
         return
@@ -558,7 +655,7 @@ async def skip(callback: CallbackQuery):
         (user_id, target_id, now_iso()),
     )
     db.commit()
-    await callback.answer("Пропущено")
+    await callback.answer("⏭ Следующая анкета")
     await show_candidate(callback.message, user_id)
 
 
@@ -610,23 +707,29 @@ async def like(callback: CallbackQuery):
             )
             new_match = cursor.rowcount == 1
 
-    await callback.answer("❤️ Симпатия отправлена")
+    await callback.answer("❤️ Симпатия отправлена!")
 
     if new_match:
         target = get_profile(target_id)
         current = get_profile(user_id)
 
         await callback.message.answer(
-            f"🎉 <b>Взаимная симпатия!</b>\n\n"
+            f"💘 <b>У вас взаимная симпатия!</b>\n\n"
             f"Тебе ответил(а) взаимностью: {user_contact_link(target)}\n"
-            f"Нажми на имя, чтобы начать общение!"
+            f"📍 Город: <i>{html.escape(target['city'])}</i>\n\n"
+            f"👉 Нажми на имя, чтобы написать сообщение!",
+            reply_markup=buttons([[VPN_BUTTON]]),
         )
         try:
             await callback.bot.send_message(
                 target_id,
-                f"🎉 <b>Взаимная симпатия!</b>\n\n"
-                f"У тебя мэтч с пользователем: {user_contact_link(current)}\n"
-                f"Нажми на имя, чтобы написать сообщение!",
+                f"💘 <b>У вас взаимная симпатия!</b>\n\n"
+                f"Вы понравились друг другу с: {user_contact_link(current)}\n"
+                f"📍 Город: <i>{html.escape(current['city'])}</i>\n\n"
+                f"👉 Нажми на имя, чтобы начать общение!",
+                reply_markup=buttons(
+                    [[("💌 Все симпатии", "matches")], [VPN_BUTTON]]
+                ),
             )
         except TelegramAPIError:
             logging.info("Не удалось уведомить пользователя %s", target_id)
@@ -656,16 +759,18 @@ async def matches(callback: CallbackQuery):
 
     if not visible:
         await callback.message.answer(
-            "❤️ Пока взаимных симпатий нет. Смотри анкеты и ставь лайки!",
+            "💌 <b>Список взаимных симпатий пока пуст</b>\n\n"
+            "Смотри анкеты и ставь ❤️ — как только кто-то ответит взаимностью, "
+            "здесь появится ссылка на его профиль!",
             reply_markup=main_menu(),
         )
         return
 
-    lines = ["❤️ <b>Твои взаимные симпатии:</b>\n"]
+    lines = ["💌 <b>Твои взаимные симпатии:</b>\n"]
     for index, profile in enumerate(visible, 1):
         city = html.escape(profile["city"])
         lines.append(
-            f"{index}. {user_contact_link(profile)}, {profile['age']} — {city}"
+            f"{index}. {user_contact_link(profile)}, {profile['age']} — <i>г. {city}</i>"
         )
 
     await callback.message.answer(
@@ -700,8 +805,10 @@ async def report(callback: CallbackQuery):
             (user_id, target_id, now_iso()),
         )
 
-    await callback.answer("Жалоба отправлена")
-    await callback.message.answer("🚩 Жалоба отправлена модератору.")
+    await callback.answer("🚩 Жалоба отправлена")
+    await callback.message.answer(
+        "🚩 <i>Жалоба передана модератору на проверку.</i>"
+    )
 
     target = get_profile(target_id)
     target_info = (
@@ -740,7 +847,7 @@ async def block(callback: CallbackQuery):
             (user1, user2),
         )
 
-    await callback.answer("Пользователь заблокирован")
+    await callback.answer("⛔ Пользователь добавлен в ЧС")
     await show_candidate(callback.message, user_id)
 
 
@@ -754,21 +861,27 @@ async def my_profile(callback: CallbackQuery):
     if not profile:
         await callback.message.answer(
             "У тебя пока нет анкеты.",
-            reply_markup=buttons([[("✨ Создать анкету", "profile:create")]]),
+            reply_markup=buttons(
+                [[("✨ Создать анкету", "profile:create")], [VPN_BUTTON]]
+            ),
         )
         return
 
-    status = "👁 показывается в поиске" if profile["active"] else "🙈 скрыта"
+    status = "🟢 Видна в поиске" if profile["active"] else "🔴 Скрыта из поиска"
     await send_profile_card(
         callback.message,
         profile,
         reply_markup=buttons(
             [
-                [("✏️ Заполнить заново", "profile:create")],
-                [("🏠 Главное меню", "menu")],
+                [
+                    ("✏️ Изменить анкету", "profile:create"),
+                    ("🚀 В ТОП", "boost"),
+                ],
+                [VPN_BUTTON],
+                [("🏠 В главное меню", "menu")],
             ]
         ),
-        extra_text=f"Статус: <b>{status}</b>",
+        extra_text=f"Статус анкеты: <b>{status}</b>",
     )
 
 
@@ -781,15 +894,22 @@ async def settings(callback: CallbackQuery):
         return
 
     toggle_text = (
-        "🙈 Скрыть анкету" if profile["active"] else "👁 Показать анкету"
+        "🙈 Скрыть мою анкету"
+        if profile["active"]
+        else "👁 Показать мою анкету"
     )
     await callback.message.answer(
-        "⚙️ <b>Настройки анкеты</b>",
+        "⚙️ <b>Настройки профиля</b>\n\n"
+        "Здесь ты можешь временно скрыть свою анкету из поиска или полностью удалить свои данные.",
         reply_markup=buttons(
             [
                 [(toggle_text, "profile:toggle")],
-                [("🗑 Удалить анкету", "profile:delete_ask")],
-                [("🏠 Главное меню", "menu")],
+                [
+                    ("✏️ Заполнить заново", "profile:create"),
+                    ("🗑 Удалить", "profile:delete_ask"),
+                ],
+                [VPN_BUTTON],
+                [("🏠 В главное меню", "menu")],
             ]
         ),
     )
@@ -810,9 +930,9 @@ async def toggle_profile(callback: CallbackQuery):
     db.commit()
     await callback.answer()
     await callback.message.answer(
-        "👁 Анкета теперь видна в поиске."
+        "🟢 <b>Твоя анкета снова видна в поиске!</b>"
         if new_value
-        else "🙈 Анкета скрыта из поиска.",
+        else "🔴 <b>Твоя анкета скрыта из поиска.</b>",
         reply_markup=main_menu(),
     )
 
@@ -821,8 +941,8 @@ async def toggle_profile(callback: CallbackQuery):
 async def delete_ask(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(
-        "⚠️ <b>Удалить анкету, симпатии и блокировки?</b>\n\n"
-        "Это действие нельзя отменить.",
+        "⚠️ <b>Ты точно хочешь удалить свою анкету?</b>\n\n"
+        "Все твои симпатии, мэтчи и настройки будут безвозвратно удалены.",
         reply_markup=buttons(
             [
                 [("🗑 Да, удалить навсегда", "profile:delete_confirm")],
@@ -852,7 +972,9 @@ async def delete_confirm(callback: CallbackQuery):
 
     await callback.answer("Анкета удалена")
     await callback.message.answer(
-        "🗑 Анкета полностью удалена.\nДля создания новой отправь /start."
+        "🗑 <b>Твоя анкета полностью удалена.</b>\n\n"
+        "Если захочешь вернуться — просто нажми /start!",
+        reply_markup=buttons([[VPN_BUTTON]]),
     )
 
 
@@ -860,11 +982,13 @@ async def delete_confirm(callback: CallbackQuery):
 async def safety(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(
-        "🛡 <b>Правила безопасности</b>\n\n"
+        "🛡 <b>Правила безопасного общения</b>\n\n"
+        "<blockquote>"
         "• Никогда не переводите незнакомцам деньги и не сообщайте коды из СМС.\n"
-        "• Не публикуйте домашний адрес и данные документов.\n"
-        "• Используйте кнопки «Жалоба» и «Блокировка» при подозрительном поведении.\n"
-        "• Первые встречи назначайте только в людных общественных местах.",
+        "• Не публикуйте свой домашний адрес и личные документы.\n"
+        "• Используйте кнопки «🚩 Жалоба» и «⛔ В ЧС» при подозрительном поведении.\n"
+        "• Первые встречи назначайте только в людных общественных местах."
+        "</blockquote>",
         reply_markup=main_menu(),
     )
 
@@ -873,11 +997,14 @@ async def safety(callback: CallbackQuery):
 async def menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    await callback.message.answer("🏠 Главное меню", reply_markup=main_menu())
+    await callback.message.answer(
+        "🏠 <b>Главное меню</b>\nВыбирай нужное действие 👇",
+        reply_markup=main_menu(),
+    )
 
 
 # ============================================================
-# ОПЛАТА TELEGRAM STARS И ПОДДЕРЖКА
+# ОПЛАТА ЧЕРЕЗ ЮMONEY И ПОДДЕРЖКА
 # ============================================================
 @dp.callback_query(F.data == "boost")
 async def boost_info(callback: CallbackQuery):
@@ -888,31 +1015,53 @@ async def boost_info(callback: CallbackQuery):
         return
     if profile["age"] < 18:
         await callback.message.answer(
-            "Платные функции доступны только пользователям 18+."
+            "🔒 Платные функции доступны только пользователям старше 18 лет.",
+            reply_markup=main_menu(),
         )
         return
     if not profile["active"]:
         await callback.message.answer(
-            "Сначала включи показ анкеты в настройках."
+            "Сначала включи показ анкеты в настройках.",
+            reply_markup=main_menu(),
         )
         return
-    if not PAYMENTS_ENABLED:
+    if not PAYMENTS_ENABLED or not YOOMONEY_WALLET or not YOOMONEY_TOKEN:
         await callback.message.answer(
-            "🚀 <b>Поднятие анкеты</b>\n\n"
-            "Платежи временно отключены (тестовый режим).",
+            "🚀 <b>Поднятие анкеты в ТОП</b>\n\n"
+            "Платежи временно отключены или настраиваются администратором.",
             reply_markup=main_menu(),
         )
         return
 
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    active_boost_note = ""
+    if profile["boost_until"] > now_ts:
+        until_dt = datetime.fromtimestamp(profile["boost_until"], timezone.utc)
+        active_boost_note = (
+            f"\n⚡️ <i>У тебя уже активно поднятие до {until_dt.strftime('%d.%m.%Y %H:%M')} UTC. "
+            f"Новая покупка добавит ещё +24 часа.</i>\n"
+        )
+
     await callback.message.answer(
-        "🚀 <b>Поднятие анкеты</b>\n\n"
-        "Твоя анкета получит значок ⚡ и приоритет в поиске на 24 часа.\n"
-        f"Стоимость: <b>{BOOST_PRICE_STARS} Telegram Stars</b>.\n\n"
-        "Покупка разовая, без автопродления.",
+        "🚀 <b>Поднятие анкеты в ТОП на 24 часа</b>\n\n"
+        "<blockquote>"
+        "⚡️ Специальный значок <b>TOP</b> возле имени\n"
+        "🔝 Приоритетный показ твоей анкеты всем пользователям\n"
+        "❤️ В среднем в 4 раза больше лайков и взаимных симпатий"
+        "</blockquote>\n"
+        f"💳 Стоимость: <b>{BOOST_PRICE_RUB} ₽</b> (Карта РФ / ЮMoney)\n"
+        f"{active_boost_note}\n"
+        "<i>Покупка разовая, без скрытых подписок.</i>",
         reply_markup=buttons(
             [
-                [("⭐ Купить поднятие", "buy:boost")],
-                [("🏠 Главное меню", "menu")],
+                [
+                    (
+                        f"💳 Оплатить {BOOST_PRICE_RUB} ₽ и поднять",
+                        "buy:boost",
+                    )
+                ],
+                [VPN_BUTTON],
+                [("🏠 В главное меню", "menu")],
             ]
         ),
     )
@@ -922,8 +1071,8 @@ async def boost_info(callback: CallbackQuery):
 async def buy_boost(callback: CallbackQuery):
     user_id = callback.from_user.id
     profile = get_profile(user_id)
-    if not PAYMENTS_ENABLED:
-        await callback.answer("Платежи отключены.", show_alert=True)
+    if not PAYMENTS_ENABLED or not YOOMONEY_WALLET or not YOOMONEY_TOKEN:
+        await callback.answer("Платежи сейчас недоступны.", show_alert=True)
         return
     if not profile or profile["age"] < 18 or not profile["active"]:
         await callback.answer(
@@ -931,96 +1080,62 @@ async def buy_boost(callback: CallbackQuery):
         )
         return
 
-    order_id = secrets.token_hex(16)
+    order_id = secrets.token_hex(12)
     db.execute(
         """
         INSERT INTO orders (order_id, user_id, product, amount, currency, status, created_at)
-        VALUES (?, ?, 'boost', ?, 'XTR', 'pending', ?)
+        VALUES (?, ?, 'boost', ?, 'RUB', 'pending', ?)
         """,
-        (order_id, user_id, BOOST_PRICE_STARS, now_iso()),
+        (order_id, user_id, BOOST_PRICE_RUB, now_iso()),
     )
     db.commit()
+
+    pay_url = build_yoomoney_url(order_id, BOOST_PRICE_RUB)
+
     await callback.answer()
-
-    try:
-        await callback.bot.send_invoice(
-            chat_id=user_id,
-            title="Поднятие анкеты на 24 часа",
-            description="Приоритет показа анкеты в поиске на 24 часа. Разовая покупка.",
-            payload=order_id,
-            currency="XTR",
-            prices=[
-                LabeledPrice(label="Поднятие анкеты", amount=BOOST_PRICE_STARS)
-            ],
-        )
-    except TelegramAPIError:
-        logging.exception("Не удалось создать счёт")
-        await callback.message.answer(
-            "Не получилось создать счёт. Попробуй позже."
-        )
-
-
-@dp.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    order = db.execute(
-        "SELECT * FROM orders WHERE order_id = ?",
-        (query.invoice_payload,),
-    ).fetchone()
-    profile = get_profile(query.from_user.id)
-
-    valid = (
-        PAYMENTS_ENABLED
-        and order is not None
-        and order["user_id"] == query.from_user.id
-        and order["product"] == "boost"
-        and order["status"] == "pending"
-        and query.currency == "XTR"
-        and query.total_amount == order["amount"]
-        and profile is not None
-        and profile["age"] >= 18
-        and profile["active"]
+    await callback.message.answer(
+        f"🧾 <b>Счёт #{order_id[:8]} сформирован!</b>\n\n"
+        f"Сумма к оплате: <b>{BOOST_PRICE_RUB} ₽</b>\n\n"
+        "1️⃣ Нажми кнопку <b>«Перейти к оплате»</b> ниже.\n"
+        "2️⃣ После оплаты вернись в бот и нажми <b>«🔄 Я оплатил(а) — Проверить»</b>.",
+        reply_markup=buttons(
+            [
+                [(f"💳 Перейти к оплате ({BOOST_PRICE_RUB} ₽)", pay_url)],
+                [("🔄 Я оплатил(а) — Проверить", f"check_pay:{order_id}")],
+                [VPN_BUTTON],
+                [("🏠 В главное меню", "menu")],
+            ]
+        ),
     )
-    if not valid:
-        await query.answer(
-            ok=False, error_message="Заказ недействителен. Создай новый счёт."
-        )
-        return
-    await query.answer(ok=True)
 
 
-@dp.message(F.successful_payment)
-async def successful_payment(message: Message):
-    payment = message.successful_payment
-    order_id = payment.invoice_payload
-    user_id = message.from_user.id
-    charge_id = payment.telegram_payment_charge_id
+@dp.callback_query(F.data.startswith("check_pay:"))
+async def check_payment_callback(callback: CallbackQuery):
+    order_id = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
 
     order = db.execute(
-        "SELECT * FROM orders WHERE order_id = ?", (order_id,)
+        "SELECT * FROM orders WHERE order_id = ? AND user_id = ?",
+        (order_id, user_id),
     ).fetchone()
+
     if not order:
-        await message.answer(
-            "Платёж получен, но заказ не найден. Напиши в /paysupport."
-        )
-        await notify_admin(
-            message.bot, f"⚠️ Неизвестный заказ {order_id} от {user_id}"
-        )
+        await callback.answer("Заказ не найден.", show_alert=True)
         return
 
     if order["status"] == "paid":
+        await callback.answer(
+            "✅ Этот счёт уже оплачен и активирован!", show_alert=True
+        )
+        await clear_old_markup(callback)
         return
 
-    valid = (
-        order["status"] == "pending"
-        and order["user_id"] == user_id
-        and order["product"] == "boost"
-        and payment.currency == order["currency"] == "XTR"
-        and payment.total_amount == order["amount"]
-    )
-    if not valid:
-        await message.answer("Ошибка проверки платежа. Напиши в /paysupport.")
-        await notify_admin(
-            message.bot, f"⚠️ Ошибка сверки заказа {order_id} от {user_id}"
+    operation_id = await verify_yoomoney_payment(order_id, order["amount"])
+    if not operation_id:
+        await callback.answer(
+            "⏳ Платёж ещё не поступил.\n"
+            "Если ты только что оплатил(а), подожди 10–20 секунд и нажми кнопку проверки ещё раз.",
+            show_alert=True,
         )
         return
 
@@ -1029,12 +1144,14 @@ async def successful_payment(message: Message):
         with db:
             cursor = db.execute(
                 """
-                UPDATE orders SET status = 'paid', telegram_charge_id = ?
+                UPDATE orders
+                SET status = 'paid', telegram_charge_id = ?
                 WHERE order_id = ? AND status = 'pending'
                 """,
-                (charge_id, order_id),
+                (operation_id, order_id),
             )
             if cursor.rowcount != 1:
+                await callback.answer("Заказ уже обработан.")
                 return
 
             if profile and profile["age"] >= 18:
@@ -1048,22 +1165,26 @@ async def successful_payment(message: Message):
             else:
                 boost_until = None
     except sqlite3.IntegrityError:
+        await callback.answer("Этот платёж уже был учтён ранее.")
         return
 
+    await clear_old_markup(callback)
+
     if boost_until is None:
-        await message.answer(
-            "Платёж получен, но услугу не удалось активировать. Напиши в /paysupport."
+        await callback.message.answer(
+            "Платёж получен, но твой профиль не найден или не подходит по возрасту. Напиши в /paysupport."
         )
         await notify_admin(
-            message.bot,
-            f"⚠️ Ручная проверка заказа {order_id}, юзер {user_id}",
+            callback.bot,
+            f"⚠️ Оплачен заказ ЮMoney {order_id}, но не активирован (юзер {user_id})",
         )
         return
 
     until = datetime.fromtimestamp(boost_until, timezone.utc)
-    await message.answer(
-        "⚡ <b>Поднятие анкеты активировано!</b>\n\n"
-        f"Действует до: {until.strftime('%d.%m.%Y %H:%M')} UTC.",
+    await callback.answer("🎉 Оплата подтверждена!")
+    await callback.message.answer(
+        "⚡️ <b>Оплата прошла успешно! Твоя анкета в ТОПе!</b>\n\n"
+        f"Приоритетный показ действует до: <b>{until.strftime('%d.%m.%Y %H:%M')} UTC</b>.",
         reply_markup=main_menu(),
     )
 
@@ -1077,8 +1198,9 @@ async def payment_support(message: Message, state: FSMContext):
     await state.set_state(SupportForm.message)
     await message.answer(
         "💬 <b>Поддержка по платежам</b>\n\n"
-        "Опиши свою проблему одним сообщением, и я перешлю его администратору.\n"
-        "Для отмены нажми /cancel."
+        "Опиши свою проблему одним сообщением (укажи номер счёта или время оплаты), "
+        "и я сразу передам его администратору.\n\n"
+        "<i>Для отмены нажми /cancel</i>"
     )
 
 
@@ -1097,10 +1219,10 @@ async def process_support_message(message: Message, state: FSMContext):
         message.bot,
         f"💳 <b>Обращение в /paysupport</b>\n"
         f"От: <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> ({username}, ID: <code>{user.id}</code>)\n\n"
-        f"Текст:\n{html.escape(text)}",
+        f"<blockquote>{html.escape(text)}</blockquote>",
     )
     await message.answer(
-        "✅ Твоё обращение отправлено администратору! Ожидай ответа.",
+        "✅ <b>Твоё обращение отправлено администратору!</b>\nОжидай ответа в ближайшее время.",
         reply_markup=main_menu(),
     )
 
@@ -1119,10 +1241,10 @@ async def main():
 
         await bot.set_my_commands(
             [
-                BotCommand(command="start", description="Главное меню"),
-                BotCommand(command="cancel", description="Отменить ввод"),
+                BotCommand(command="start", description="🏠 Главное меню"),
+                BotCommand(command="cancel", description="↩️ Отменить действие"),
                 BotCommand(
-                    command="paysupport", description="Помощь с оплатой"
+                    command="paysupport", description="💬 Помощь с оплатой"
                 ),
             ]
         )
@@ -1137,8 +1259,7 @@ async def main():
         )
         logging.error(
             "❌ ОШИБКА АВТОРИЗАЦИИ: Telegram отклонил токен [%s].\n"
-            "1. Зайди в @BotFather -> /revoke и получи новый токен.\n"
-            "2. Вставь новый токен в файл .env И в настройки переменных (Variables) на хостинге!",
+            "Проверь файл .env и настройки переменных (Variables) на хостинге!",
             masked,
         )
     finally:
