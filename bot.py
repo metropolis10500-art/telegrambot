@@ -1,27 +1,25 @@
-"""
-════════════════════════════════════════════════════════════════════════════════
-    BASTION PRO & MARKET — P2P ЭСКРОУ-МАРКЕТПЛЕЙС С КОШЕЛЬКОМ
-    • Кошелёк: пополнение счета, баланс покупок, вывод
-    • Каталог с подменю соцсетей и площадок (скриншоты)
-    • Генерация прямых ссылок на товары для продавцов
-    • Отзывы и рейтинг FunPay / Kwork (% положительных)
-    • SQLite WAL (без aiosqlite, не зависает)
-    • Комиссия платформы: 40%
-════════════════════════════════════════════════════════════════════════════════
-"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
+import html
 import logging
 import os
+import re
 import sqlite3
+import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Callable, Optional
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -32,43 +30,191 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+    TelegramObject,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ЗАГРУЗКА .ENV
-# ══════════════════════════════════════════════════════════════════════════════
-def load_env_file(filepath: str = ".env"):
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
 
-load_env_file(".env")
+# =========================================================
+# LOGGING
+# =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7969032609:AAHTR51-aGgN1n9j33tG-m56G4XJ4-mX2qA")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5693051419"))
-DB_FILE = os.getenv("DB_FILE", "bastion_market_v2.db")
-SUPPORT_HANDLE = os.getenv("SUPPORT_HANDLE", "@vladofix97")
-COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.40"))
-MIN_WITHDRAW = float(os.getenv("MIN_WITHDRAW", "500.0"))
-PARITYPAY_SHOP_ID = os.getenv("PARITYPAY_SHOP_ID", "YOUR_SHOP_ID")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("BastionPRO")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# СПИСОК КАТЕГОРИЙ ИЗ СКРИНШОТОВ
-# ══════════════════════════════════════════════════════════════════════════════
-CATEGORIES: List[Tuple[str, str]] = [
+# =========================================================
+# HELPERS AND CONFIGURATION
+# =========================================================
+
+def parse_money(value: str) -> int:
+    """
+    Converts rubles to kopecks.
+    Example: "1 250,50" -> 125050
+    """
+    normalized = str(value).replace(" ", "").replace(",", ".").strip()
+
+    try:
+        amount = Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError("Некорректная сумма") from exc
+
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Сумма должна быть положительной")
+
+    kopecks = (amount * 100).quantize(
+        Decimal("1"),
+        rounding=ROUND_HALF_UP,
+    )
+
+    return int(kopecks)
+
+
+def format_money(kopecks: int | None) -> str:
+    value = Decimal(int(kopecks or 0)) / Decimal("100")
+    return f"{value:.2f}"
+
+
+def parse_rate(name: str, default: str) -> Decimal:
+    raw = os.getenv(name, default).strip()
+
+    try:
+        rate = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(f"{name} содержит некорректное значение") from exc
+
+    if rate < 0 or rate >= 1:
+        raise RuntimeError(f"{name} должен быть от 0 до 0.9999")
+
+    return rate
+
+
+def calculate_fee(amount_kopecks: int, rate: Decimal) -> int:
+    return int(
+        (Decimal(amount_kopecks) * rate).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
+
+
+def escape(value: Any) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def clean_username(username: Optional[str]) -> str:
+    return (username or "").replace("@", "").strip()
+
+
+def parse_admin_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            try:
+                result.add(int(item))
+            except ValueError:
+                raise RuntimeError(f"Некорректный ADMIN_ID: {item}")
+
+    if not result:
+        raise RuntimeError("Не указан ADMIN_ID или ADMIN_IDS")
+
+    return result
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Не задан BOT_TOKEN. Укажите новый токен через переменную окружения."
+    )
+
+ADMIN_IDS = parse_admin_ids(
+    os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).strip()
+)
+
+DB_FILE = os.getenv("DB_FILE", "bastion_market_v3.db").strip()
+
+SUPPORT_CLEAN = re.sub(
+    r"[^A-Za-z0-9_]",
+    "",
+    os.getenv("SUPPORT_HANDLE", "vladofix97").lstrip("@"),
+)
+SUPPORT_HANDLE = f"@{SUPPORT_CLEAN}" if SUPPORT_CLEAN else "службу поддержки"
+SUPPORT_URL = (
+    f"https://t.me/{SUPPORT_CLEAN}"
+    if SUPPORT_CLEAN
+    else None
+)
+
+BUYER_DEPOSIT_RATE = parse_rate("BUYER_DEPOSIT_FEE", "0.30")
+SELLER_COMMISSION_RATE = parse_rate("SELLER_COMMISSION_RATE", "0.40")
+
+MIN_WITHDRAW_KOPECKS = parse_money(
+    os.getenv("MIN_WITHDRAW", "500")
+)
+MIN_TOPUP_KOPECKS = parse_money(
+    os.getenv("MIN_TOPUP", "50")
+)
+MIN_PRODUCT_PRICE_KOPECKS = parse_money(
+    os.getenv("MIN_PRODUCT_PRICE", "50")
+)
+
+# Не является интеграцией с платёжной системой.
+# Пример:
+# PAYMENT_URL_TEMPLATE=
+#   https://example.com/pay?order_id={topup_id}&amount={total}
+PAYMENT_URL_TEMPLATE = os.getenv(
+    "PAYMENT_URL_TEMPLATE",
+    "",
+).strip()
+
+ONYX_VPN_URL = os.getenv(
+    "ONYX_VPN_URL",
+    "https://t.me/vpnonyxxbot",
+).strip()
+
+
+def build_payment_url(topup_id: int, total_kopecks: int) -> Optional[str]:
+    if not PAYMENT_URL_TEMPLATE:
+        return None
+
+    try:
+        return PAYMENT_URL_TEMPLATE.format(
+            topup_id=topup_id,
+            total=format_money(total_kopecks),
+            total_kopecks=total_kopecks,
+        )
+    except Exception:
+        logger.exception("Некорректный PAYMENT_URL_TEMPLATE")
+        return None
+
+
+def rate_percent(rate: Decimal) -> str:
+    value = rate * 100
+    return f"{value.normalize()}%"
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def mask_requisites(value: str) -> str:
+    value = value.strip()
+    if len(value) <= 4:
+        return "••••"
+    return "••••" + value[-4:]
+
+
+# =========================================================
+# CATEGORIES
+# =========================================================
+
+CATEGORIES = (
     ("max", "🟣 MAX"),
     ("telegram", "✈️ Telegram"),
     ("tg_premium", "⭐ Telegram Premium"),
@@ -86,1546 +232,3446 @@ CATEGORIES: List[Tuple[str, str]] = [
     ("dzen", "✨ Дзен"),
     ("trovo", "🦎 Trovo"),
     ("github", "🐙 Github"),
-]
+)
 
-CAT_DICT = dict(CATEGORIES)
+CATEGORIES_DICT = dict(CATEGORIES)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# БАЗА ДАННЫХ SQLITE (ВЫСОКОСКОРОСТНОЙ WAL РЕЖИМ)
-# ══════════════════════════════════════════════════════════════════════════════
-def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=15000;")
-    return conn
+MAIN_MENU_TEXTS = {
+    "🛍 Каталог товаров",
+    "📦 Мои товары",
+    "👛 Кошелёк",
+    "📂 Мои сделки",
+    "👤 Профиль",
+    "💳 Вывод средств",
+    "🌐 Подключить OnyxVPN",
+    "ℹ️ Помощь / Поддержка",
+}
 
-def _sync_execute(query: str, params: tuple = (), fetch: Optional[str] = None, commit: bool = False) -> Any:
-    with _get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        res = None
-        if fetch == "one":
-            row = cur.fetchone()
-            res = dict(row) if row else None
-        elif fetch == "all":
-            rows = cur.fetchall()
-            res = [dict(r) for r in rows]
-        if commit:
-            conn.commit()
-            if not fetch:
-                res = cur.lastrowid
-        return res
 
-def _sync_transaction(operations: List[tuple]) -> None:
-    with _get_connection() as conn:
-        cur = conn.cursor()
-        for q, p in operations:
-            cur.execute(q, p)
-        conn.commit()
+# =========================================================
+# DATABASE ENGINE
+# =========================================================
 
-async def db_get_one(query: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    return await asyncio.to_thread(_sync_execute, query, params, fetch="one")
+db_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="bastion_db",
+)
 
-async def db_get_all(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(_sync_execute, query, params, fetch="all")
+_persistent_conn: Optional[sqlite3.Connection] = None
 
-async def db_execute(query: str, params: tuple = (), commit: bool = True) -> Any:
-    return await asyncio.to_thread(_sync_execute, query, params, commit=commit)
 
-async def db_transaction(operations: List[tuple]) -> None:
-    await asyncio.to_thread(_sync_transaction, operations)
+def _get_worker_connection() -> sqlite3.Connection:
+    global _persistent_conn
 
-async def init_db():
-    schema = """
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        balance REAL DEFAULT 0.0,
-        rating_sum REAL DEFAULT 0.0,
-        rating_count INTEGER DEFAULT 0,
-        pos_reviews INTEGER DEFAULT 0,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        seller_id INTEGER,
-        category TEXT,
-        title TEXT,
-        description TEXT,
-        price REAL,
-        status TEXT DEFAULT 'active', -- active, sold, deleted
-        created_at TEXT,
-        FOREIGN KEY(seller_id) REFERENCES users(user_id)
-    );
-    CREATE TABLE IF NOT EXISTS deals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER,
-        buyer_id INTEGER,
-        seller_id INTEGER,
-        title TEXT,
-        amount REAL,
-        fee REAL,
-        seller_receives REAL,
-        status TEXT DEFAULT 'waiting_payment', -- waiting_payment, paid, shipped, dispute, completed, cancelled
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS topups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount REAL,
-        status TEXT DEFAULT 'pending', -- pending, completed
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS withdrawals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount REAL,
-        requisites TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        deal_id INTEGER,
-        target_user_id INTEGER,
-        author_user_id INTEGER,
-        rating INTEGER,
-        comment TEXT,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS platform_vault (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        deal_id INTEGER,
-        fee_amount REAL,
-        created_at TEXT
-    );
-    """
-    def _create():
-        with _get_connection() as conn:
-            conn.executescript(schema)
-            conn.commit()
-    await asyncio.to_thread(_create)
-    logger.info("База данных инициализирована.")
-
-async def get_or_create_user(user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
-    user = await db_get_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    clean_username = f"@{username}" if username else "Пользователь"
-    if not user:
-        await db_execute(
-            "INSERT INTO users (user_id, username, balance, rating_sum, rating_count, pos_reviews, created_at) VALUES (?, ?, 0.0, 0.0, 0, 0, ?)",
-            (user_id, clean_username, datetime.now().isoformat())
+    if _persistent_conn is None:
+        _persistent_conn = sqlite3.connect(
+            DB_FILE,
+            timeout=30,
+            check_same_thread=False,
+            isolation_level=None,
         )
-        user = await db_get_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    elif username and user["username"] != clean_username:
-        await db_execute("UPDATE users SET username = ? WHERE user_id = ?", (clean_username, user_id))
-        user["username"] = clean_username
-    return user
+        _persistent_conn.row_factory = sqlite3.Row
 
-async def safe_edit_text(message: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+        _persistent_conn.execute("PRAGMA journal_mode=WAL")
+        _persistent_conn.execute("PRAGMA synchronous=NORMAL")
+        _persistent_conn.execute("PRAGMA foreign_keys=ON")
+        _persistent_conn.execute("PRAGMA busy_timeout=30000")
+        _persistent_conn.execute("PRAGMA cache_size=-64000")
+        _persistent_conn.execute("PRAGMA temp_store=MEMORY")
+
+    return _persistent_conn
+
+
+def _worker_call(
+    function: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    conn = _get_worker_connection()
+    return function(conn, *args)
+
+
+async def db_call(
+    function: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    loop = asyncio.get_running_loop()
+
+    return await loop.run_in_executor(
+        db_executor,
+        functools.partial(_worker_call, function, *args),
+    )
+
+
+def _select_one(
+    conn: sqlite3.Connection,
+    query: str,
+    params: tuple = (),
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(query, params).fetchone()
+    return dict(row) if row else None
+
+
+def _select_all(
+    conn: sqlite3.Connection,
+    query: str,
+    params: tuple = (),
+) -> list[dict[str, Any]]:
+    rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _execute(
+    conn: sqlite3.Connection,
+    query: str,
+    params: tuple = (),
+) -> dict[str, int]:
+    cursor = conn.execute(query, params)
+
+    return {
+        "rowcount": cursor.rowcount,
+        "lastrowid": int(cursor.lastrowid or 0),
+    }
+
+
+async def db_fetchone(
+    query: str,
+    params: tuple = (),
+) -> Optional[dict[str, Any]]:
+    return await db_call(_select_one, query, params)
+
+
+async def db_fetchall(
+    query: str,
+    params: tuple = (),
+) -> list[dict[str, Any]]:
+    return await db_call(_select_all, query, params)
+
+
+async def db_execute(
+    query: str,
+    params: tuple = (),
+) -> dict[str, int]:
+    return await db_call(_execute, query, params)
+
+
+def _transaction(
+    conn: sqlite3.Connection,
+    function: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    conn.execute("BEGIN IMMEDIATE")
+
     try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            logger.warning(f"safe_edit warning: {e}")
+        result = function(conn, *args)
+        conn.execute("COMMIT")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FSM СОСТОЯНИЯ
-# ══════════════════════════════════════════════════════════════════════════════
-class TopupStates(StatesGroup):
-    amount = State()
 
-class AddProductStates(StatesGroup):
+async def db_transaction(
+    function: Callable[..., Any],
+    *args: Any,
+) -> Any:
+    return await db_call(_transaction, function, *args)
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL DEFAULT '',
+            balance_kopecks INTEGER NOT NULL DEFAULT 0
+                CHECK(balance_kopecks >= 0),
+            rating_sum INTEGER NOT NULL DEFAULT 0
+                CHECK(rating_sum >= 0),
+            rating_count INTEGER NOT NULL DEFAULT 0
+                CHECK(rating_count >= 0),
+            pos_reviews INTEGER NOT NULL DEFAULT 0
+                CHECK(pos_reviews >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            price_kopecks INTEGER NOT NULL
+                CHECK(price_kopecks > 0),
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active', 'sold', 'deleted')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (seller_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL UNIQUE,
+            buyer_id INTEGER NOT NULL,
+            seller_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            amount_kopecks INTEGER NOT NULL
+                CHECK(amount_kopecks > 0),
+            fee_kopecks INTEGER NOT NULL
+                CHECK(fee_kopecks >= 0),
+            seller_receives_kopecks INTEGER NOT NULL
+                CHECK(seller_receives_kopecks >= 0),
+            status TEXT NOT NULL DEFAULT 'paid'
+                CHECK(status IN (
+                    'created',
+                    'paid',
+                    'completed',
+                    'dispute',
+                    'cancelled',
+                    'refunded'
+                )),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (buyer_id) REFERENCES users(user_id),
+            FOREIGN KEY (seller_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS topups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            credit_kopecks INTEGER NOT NULL
+                CHECK(credit_kopecks > 0),
+            fee_kopecks INTEGER NOT NULL
+                CHECK(fee_kopecks >= 0),
+            total_kopecks INTEGER NOT NULL
+                CHECK(total_kopecks > 0),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'paid', 'rejected')),
+            check_requested_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount_kopecks INTEGER NOT NULL
+                CHECK(amount_kopecks > 0),
+            requisites TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'completed', 'rejected')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deal_id INTEGER NOT NULL,
+            target_user_id INTEGER NOT NULL,
+            author_user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL
+                CHECK(rating BETWEEN 1 AND 5),
+            comment TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(deal_id, author_user_id),
+            FOREIGN KEY (deal_id) REFERENCES deals(id),
+            FOREIGN KEY (target_user_id) REFERENCES users(user_id),
+            FOREIGN KEY (author_user_id) REFERENCES users(user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS platform_vault (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
+            fee_kopecks INTEGER NOT NULL
+                CHECK(fee_kopecks >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_type, source_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER,
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            details TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_products_category_status
+            ON products(category, status);
+
+        CREATE INDEX IF NOT EXISTS idx_products_seller_status
+            ON products(seller_id, status);
+
+        CREATE INDEX IF NOT EXISTS idx_deals_buyer
+            ON deals(buyer_id);
+
+        CREATE INDEX IF NOT EXISTS idx_deals_seller
+            ON deals(seller_id);
+
+        CREATE INDEX IF NOT EXISTS idx_withdrawals_status
+            ON withdrawals(status);
+
+        CREATE INDEX IF NOT EXISTS idx_topups_status
+            ON topups(status);
+        """
+    )
+
+
+async def init_database() -> None:
+    await db_call(_init_schema)
+    logger.info("Database initialized: %s", DB_FILE)
+
+
+def _ensure_user_tx(
+    conn: sqlite3.Connection,
+    user_id: int,
+    username: str,
+) -> dict[str, Any]:
+    conn.execute(
+        """
+        INSERT INTO users(user_id, username)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username = CASE
+                WHEN excluded.username <> '' THEN excluded.username
+                ELSE users.username
+            END
+        """,
+        (user_id, username),
+    )
+
+    row = conn.execute(
+        "SELECT * FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    return dict(row)
+
+
+async def get_or_create_user(
+    user_id: int,
+    username: Optional[str] = "",
+) -> dict[str, Any]:
+    return await db_transaction(
+        _ensure_user_tx,
+        user_id,
+        clean_username(username),
+    )
+
+
+# =========================================================
+# ATOMIC FINANCIAL OPERATIONS
+# =========================================================
+
+def _create_deal_tx(
+    conn: sqlite3.Connection,
+    product_id: int,
+    buyer_id: int,
+) -> Optional[dict[str, Any]]:
+    product_row = conn.execute(
+        """
+        SELECT *
+        FROM products
+        WHERE id = ? AND status = 'active'
+        """,
+        (product_id,),
+    ).fetchone()
+
+    if not product_row:
+        return None
+
+    product = dict(product_row)
+    price = int(product["price_kopecks"])
+    seller_fee = calculate_fee(price, SELLER_COMMISSION_RATE)
+    seller_receives = price - seller_fee
+
+    balance_update = conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks - ?
+        WHERE user_id = ?
+          AND balance_kopecks >= ?
+        """,
+        (price, buyer_id, price),
+    )
+
+    if balance_update.rowcount != 1:
+        return None
+
+    product_update = conn.execute(
+        """
+        UPDATE products
+        SET status = 'sold'
+        WHERE id = ? AND status = 'active'
+        """,
+        (product_id,),
+    )
+
+    if product_update.rowcount != 1:
+        return None
+
+    cursor = conn.execute(
+        """
+        INSERT INTO deals(
+            product_id,
+            buyer_id,
+            seller_id,
+            title,
+            amount_kopecks,
+            fee_kopecks,
+            seller_receives_kopecks,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')
+        """,
+        (
+            product_id,
+            buyer_id,
+            product["seller_id"],
+            product["title"],
+            price,
+            seller_fee,
+            seller_receives,
+        ),
+    )
+
+    deal_id = int(cursor.lastrowid)
+
+    conn.execute(
+        """
+        INSERT INTO audit_log(
+            actor_id,
+            action,
+            entity_type,
+            entity_id,
+            details
+        )
+        VALUES (?, 'deal_paid', 'deal', ?, ?)
+        """,
+        (buyer_id, deal_id, f"product_id={product_id}"),
+    )
+
+    return {
+        "deal_id": deal_id,
+        "product_id": product_id,
+        "buyer_id": buyer_id,
+        "seller_id": product["seller_id"],
+        "title": product["title"],
+        "amount_kopecks": price,
+        "fee_kopecks": seller_fee,
+        "seller_receives_kopecks": seller_receives,
+    }
+
+
+def _complete_deal_tx(
+    conn: sqlite3.Connection,
+    deal_id: int,
+    buyer_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM deals WHERE id = ?",
+        (deal_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    deal = dict(row)
+
+    if deal["buyer_id"] != buyer_id:
+        return None
+
+    if deal["status"] != "paid":
+        return None
+
+    updated = conn.execute(
+        """
+        UPDATE deals
+        SET status = 'completed',
+            completed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND buyer_id = ? AND status = 'paid'
+        """,
+        (deal_id, buyer_id),
+    )
+
+    if updated.rowcount != 1:
+        return None
+
+    conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks + ?
+        WHERE user_id = ?
+        """,
+        (
+            deal["seller_receives_kopecks"],
+            deal["seller_id"],
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO platform_vault(
+            source_type,
+            source_id,
+            fee_kopecks
+        )
+        VALUES ('seller_deal_fee', ?, ?)
+        """,
+        (deal_id, deal["fee_kopecks"]),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO audit_log(
+            actor_id,
+            action,
+            entity_type,
+            entity_id,
+            details
+        )
+        VALUES (?, 'deal_completed', 'deal', ?, NULL)
+        """,
+        (buyer_id, deal_id),
+    )
+
+    return deal
+
+
+def _open_dispute_tx(
+    conn: sqlite3.Connection,
+    deal_id: int,
+    actor_id: int,
+) -> tuple[Optional[dict[str, Any]], bool]:
+    row = conn.execute(
+        "SELECT * FROM deals WHERE id = ?",
+        (deal_id,),
+    ).fetchone()
+
+    if not row:
+        return None, False
+
+    deal = dict(row)
+
+    if actor_id not in (deal["buyer_id"], deal["seller_id"]):
+        return None, False
+
+    if deal["status"] == "dispute":
+        return deal, False
+
+    if deal["status"] != "paid":
+        return deal, False
+
+    updated = conn.execute(
+        """
+        UPDATE deals
+        SET status = 'dispute'
+        WHERE id = ? AND status = 'paid'
+        """,
+        (deal_id,),
+    )
+
+    if updated.rowcount != 1:
+        return deal, False
+
+    conn.execute(
+        """
+        INSERT INTO audit_log(
+            actor_id,
+            action,
+            entity_type,
+            entity_id,
+            details
+        )
+        VALUES (?, 'dispute_opened', 'deal', ?, NULL)
+        """,
+        (actor_id, deal_id),
+    )
+
+    return deal, True
+
+
+def _approve_topup_tx(
+    conn: sqlite3.Connection,
+    topup_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM topups WHERE id = ?",
+        (topup_id,),
+    ).fetchone()
+
+    if not row or row["status"] != "pending":
+        return None
+
+    topup = dict(row)
+
+    updated = conn.execute(
+        """
+        UPDATE topups
+        SET status = 'paid'
+        WHERE id = ? AND status = 'pending'
+        """,
+        (topup_id,),
+    )
+
+    if updated.rowcount != 1:
+        return None
+
+    conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks + ?
+        WHERE user_id = ?
+        """,
+        (
+            topup["credit_kopecks"],
+            topup["user_id"],
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO platform_vault(
+            source_type,
+            source_id,
+            fee_kopecks
+        )
+        VALUES ('buyer_topup_fee', ?, ?)
+        """,
+        (
+            topup_id,
+            topup["fee_kopecks"],
+        ),
+    )
+
+    return topup
+
+
+def _create_withdrawal_tx(
+    conn: sqlite3.Connection,
+    user_id: int,
+    amount_kopecks: int,
+    requisites: str,
+) -> Optional[int]:
+    updated = conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks - ?
+        WHERE user_id = ?
+          AND balance_kopecks >= ?
+        """,
+        (amount_kopecks, user_id, amount_kopecks),
+    )
+
+    if updated.rowcount != 1:
+        return None
+
+    cursor = conn.execute(
+        """
+        INSERT INTO withdrawals(
+            user_id,
+            amount_kopecks,
+            requisites,
+            status
+        )
+        VALUES (?, ?, ?, 'pending')
+        """,
+        (user_id, amount_kopecks, requisites),
+    )
+
+    withdrawal_id = int(cursor.lastrowid)
+
+    conn.execute(
+        """
+        INSERT INTO audit_log(
+            actor_id,
+            action,
+            entity_type,
+            entity_id,
+            details
+        )
+        VALUES (?, 'withdrawal_created', 'withdrawal', ?, NULL)
+        """,
+        (user_id, withdrawal_id),
+    )
+
+    return withdrawal_id
+
+
+def _approve_withdrawal_tx(
+    conn: sqlite3.Connection,
+    withdrawal_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM withdrawals WHERE id = ?",
+        (withdrawal_id,),
+    ).fetchone()
+
+    if not row or row["status"] != "pending":
+        return None
+
+    updated = conn.execute(
+        """
+        UPDATE withdrawals
+        SET status = 'completed',
+            processed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """,
+        (withdrawal_id,),
+    )
+
+    if updated.rowcount != 1:
+        return None
+
+    return dict(row)
+
+
+def _reject_withdrawal_tx(
+    conn: sqlite3.Connection,
+    withdrawal_id: int,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT * FROM withdrawals WHERE id = ?",
+        (withdrawal_id,),
+    ).fetchone()
+
+    if not row or row["status"] != "pending":
+        return None
+
+    updated = conn.execute(
+        """
+        UPDATE withdrawals
+        SET status = 'rejected',
+            processed_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """,
+        (withdrawal_id,),
+    )
+
+    if updated.rowcount != 1:
+        return None
+
+    conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks + ?
+        WHERE user_id = ?
+        """,
+        (
+            row["amount_kopecks"],
+            row["user_id"],
+        ),
+    )
+
+    return dict(row)
+
+
+def _complete_review_tx(
+    conn: sqlite3.Connection,
+    deal_id: int,
+    author_id: int,
+    rating: int,
+    comment: str,
+) -> bool:
+    deal_row = conn.execute(
+        "SELECT * FROM deals WHERE id = ?",
+        (deal_id,),
+    ).fetchone()
+
+    if not deal_row:
+        return False
+
+    deal = dict(deal_row)
+
+    if deal["buyer_id"] != author_id:
+        return False
+
+    if deal["status"] != "completed":
+        return False
+
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO reviews(
+            deal_id,
+            target_user_id,
+            author_user_id,
+            rating,
+            comment
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            deal_id,
+            deal["seller_id"],
+            author_id,
+            rating,
+            comment,
+        ),
+    )
+
+    if cursor.rowcount != 1:
+        return False
+
+    conn.execute(
+        """
+        UPDATE users
+        SET rating_sum = rating_sum + ?,
+            rating_count = rating_count + 1,
+            pos_reviews = pos_reviews + ?
+        WHERE user_id = ?
+        """,
+        (
+            rating,
+            1 if rating >= 4 else 0,
+            deal["seller_id"],
+        ),
+    )
+
+    return True
+
+
+def _delete_product_tx(
+    conn: sqlite3.Connection,
+    product_id: int,
+    seller_id: int,
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE products
+        SET status = 'deleted'
+        WHERE id = ?
+          AND seller_id = ?
+          AND status IN ('active', 'sold')
+        """,
+        (product_id, seller_id),
+    )
+
+    return cursor.rowcount == 1
+
+
+# =========================================================
+# FSM
+# =========================================================
+
+class AddProductFSM(StatesGroup):
     category = State()
     title = State()
     description = State()
     price = State()
 
-class AskSellerStates(StatesGroup):
-    product_id = State()
-    seller_id = State()
-    question = State()
 
-class ReplyQuestionStates(StatesGroup):
-    target_buyer_id = State()
-    product_id = State()
-    reply_text = State()
+class TopUpFSM(StatesGroup):
+    credit_amount = State()
 
-class WithdrawStates(StatesGroup):
+
+class WithdrawFSM(StatesGroup):
     amount = State()
     requisites = State()
 
-class ReviewStates(StatesGroup):
+
+class AskSellerFSM(StatesGroup):
+    target_seller_id = State()
+    product_id = State()
+    question_text = State()
+
+
+class AnswerBuyerFSM(StatesGroup):
+    target_buyer_id = State()
+    product_id = State()
+    answer_text = State()
+
+
+class ReviewFSM(StatesGroup):
     deal_id = State()
-    target_id = State()
     rating = State()
     comment = State()
 
-class ChatProxyStates(StatesGroup):
-    in_chat = State()
-    deal_id = State()
 
-class AdminBroadcast(StatesGroup):
-    text = State()
+# =========================================================
+# BOT AND UI
+# =========================================================
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ГЛАВНОЕ МЕНЮ (ОБНОВЛЁННОЕ)
-# ══════════════════════════════════════════════════════════════════════════════
-def get_main_keyboard():
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+BOT_USERNAME = ""
+
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛍 Каталог товаров"), KeyboardButton(text="📦 Мои товары")],
-            [KeyboardButton(text="👛 Кошелёк"), KeyboardButton(text="📂 Мои сделки")],
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="💳 Вывод средств")],
-            [KeyboardButton(text="🌐 Подключить OnyxVPN"), KeyboardButton(text="ℹ️ Помощь / Поддержка")]
+            [
+                KeyboardButton(text="🛍 Каталог товаров"),
+                KeyboardButton(text="📦 Мои товары"),
+            ],
+            [
+                KeyboardButton(text="👛 Кошелёк"),
+                KeyboardButton(text="📂 Мои сделки"),
+            ],
+            [
+                KeyboardButton(text="👤 Профиль"),
+                KeyboardButton(text="💳 Вывод средств"),
+            ],
+            [
+                KeyboardButton(text="🌐 Подключить OnyxVPN"),
+                KeyboardButton(text="ℹ️ Помощь / Поддержка"),
+            ],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
-def get_cancel_reply_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
-        resize_keyboard=True
-    )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# СТАРТ И ДИПЛИНКИ НА ТОВАРЫ И СДЕЛКИ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    await get_or_create_user(user_id, message.from_user.username)
+def get_categories_keyboard(action: str = "view") -> InlineKeyboardMarkup:
+    prefix = "cat_v_" if action == "view" else "cat_a_"
 
-    args = command.args
-    if args:
-        if args.startswith("item_"):
-            try:
-                prod_id = int(args.replace("item_", ""))
-                await show_product_card(message, prod_id, user_id)
-                return
-            except Exception as e:
-                logger.error(f"Ошибка перехода по товару: {e}")
-        elif args.startswith("deal_"):
-            try:
-                deal_id = int(args.replace("deal_", ""))
-                await render_deal_view(message, deal_id, user_id)
-                return
-            except Exception as e:
-                logger.error(f"Ошибка перехода по сделке: {e}")
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
 
-    welcome = (
-        f"🛡 <b>Эскроу-маркетплейс «BastionPRO»</b>\n"
-        f"────────────────────────────\n"
-        f"Здравствуйте, <b>{message.from_user.first_name}</b>!\n\n"
-        f"Добро пожаловать на безопасную биржу цифровых товаров и услуг:\n\n"
-        f"• 🛍 <b>Каталог товаров:</b> быстрый выбор аккаунтов по категориям (Telegram, Steam, VK, Discord и др.).\n"
-        f"• 👛 <b>Кошелёк:</b> пополняйте баланс и оплачивайте покупки в 1 клик.\n"
-        f"• 📦 <b>Продавцам:</b> выставляйте товары и получайте прямые ссылки на лоты для ваших клиентов.\n"
-        f"• 🛡 <b>100% Защита:</b> деньги хранятся в гаранте до подтверждения выполнения заказа.\n"
-        f"• ⭐ <b>Честные отзывы:</b> рейтинг как на FunPay (% довольных клиентов).\n\n"
-        f"📊 <b>Условия:</b>\n"
-        f"• Комиссия гаранта: <b>40%</b> (вычитается при закрытии с суммы сделки)\n"
-        f"• Выплаты: <b>каждый вторник и четверг</b> (от 500 ₽)\n"
-        f"• Арбитраж и помощь: <b>{SUPPORT_HANDLE}</b>"
-    )
-    await message.answer(welcome, reply_markup=get_main_keyboard())
-
-# ══════════════════════════════════════════════════════════════════════════════
-# КОШЕЛЁК (БАЛАНС, ПОПОЛНЕНИЕ, ВЫВОД)
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(F.text.in_(["👛 Кошелёк", "Кошелек", "Кошелёк"]))
-async def show_wallet(message: Message, state: FSMContext):
-    await state.clear()
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-
-    text = (
-        f"👛 <b>ВАШ КОШЕЛЁК BASTION</b>\n"
-        f"────────────────────────────\n"
-        f"💰 <b>Доступный баланс:</b> <b>{user['balance']:,.2f} ₽</b>\n\n"
-        f"С этого баланса вы можете мгновенно оплачивать любые товары в каталоге, "
-        f"а также накапливать средства от продаж и выводить их на банковские карты РФ или СБП.\n"
-        f"────────────────────────────\n"
-        f"📅 <i>Выплаты производятся каждый вторник и четверг (мин. {MIN_WITHDRAW:,.0f} ₽).</i>"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="wallet_topup")],
-        [InlineKeyboardButton(text="💸 Запросить вывод", callback_data="wallet_withdraw")],
-        [InlineKeyboardButton(text="🔄 Обновить баланс", callback_data="wallet_refresh")]
-    ])
-    await message.answer(text, reply_markup=kb)
-
-@router.callback_query(F.data == "wallet_refresh")
-async def cb_wallet_refresh(call: CallbackQuery):
-    user = await get_or_create_user(call.from_user.id)
-    text = (
-        f"👛 <b>ВАШ КОШЕЛЁК BASTION</b>\n"
-        f"────────────────────────────\n"
-        f"💰 <b>Доступный баланс:</b> <b>{user['balance']:,.2f} ₽</b>\n\n"
-        f"С этого баланса вы можете мгновенно оплачивать любые товары в каталоге, "
-        f"а также накапливать средства от продаж и выводить их на банковские карты РФ или СБП.\n"
-        f"────────────────────────────\n"
-        f"📅 <i>Выплаты производятся каждый вторник и четверг (мин. {MIN_WITHDRAW:,.0f} ₽).</i>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="wallet_topup")],
-        [InlineKeyboardButton(text="💸 Запросить вывод", callback_data="wallet_withdraw")],
-        [InlineKeyboardButton(text="🔄 Обновить баланс", callback_data="wallet_refresh")]
-    ])
-    await safe_edit_text(call.message, text, reply_markup=kb)
-    await call.answer("Баланс обновлен!")
-
-@router.callback_query(F.data == "wallet_topup")
-async def cb_wallet_topup(call: CallbackQuery, state: FSMContext):
-    await state.set_state(TopupStates.amount)
-    await call.message.answer(
-        "💳 <b>Пополнение баланса Кошелька</b>\n\n"
-        "Введите сумму для пополнения в рублях (минимум 50 ₽):",
-        reply_markup=get_cancel_reply_kb()
-    )
-    await call.answer()
-
-@router.message(TopupStates.amount)
-async def process_topup_amount(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Пополнение отменено.", reply_markup=get_main_keyboard())
-        return
-
-    try:
-        amount = float(message.text.replace(",", ".").strip())
-        if amount < 50.0 or amount > 300000.0:
-            await message.answer("⚠️ Сумма пополнения должна быть от 50 до 300 000 ₽. Введите сумму:")
-            return
-    except ValueError:
-        await message.answer("⚠️ Введите корректное число (например: 500):")
-        return
-
-    user_id = message.from_user.id
-    topup_id = await db_execute("""
-        INSERT INTO topups (user_id, amount, status, created_at)
-        VALUES (?, ?, 'pending', ?)
-    """, (user_id, amount, datetime.now().isoformat()))
-
-    await state.clear()
-    pay_url = f"https://app.paritypay.ru/pay/{PARITYPAY_SHOP_ID}?order_id=topup_{topup_id}&amount={amount}"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить через ParityPay", url=pay_url)],
-        [InlineKeyboardButton(text="✅ Проверить зачисление", callback_data=f"check_topup:{topup_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="close_view")]
-    ])
-
-    await message.answer(
-        f"💳 <b>Счёт на пополнение №{topup_id} сформирован!</b>\n\n"
-        f"Сумма к оплате: <b>{amount:,.2f} ₽</b>\n\n"
-        f"1. Нажмите «Оплатить через ParityPay» и завершите платеж.\n"
-        f"2. После оплаты нажмите «Проверить зачисление» для пополнения вашего кошелька.",
-        reply_markup=kb
-    )
-
-@router.callback_query(F.data.startswith("check_topup:"))
-async def cb_check_topup(call: CallbackQuery):
-    topup_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    topup = await db_get_one("SELECT * FROM topups WHERE id = ? AND user_id = ?", (topup_id, user_id))
-    if not topup:
-        await call.answer("Счёт не найден.", show_alert=True)
-        return
-
-    if topup["status"] == "completed":
-        await call.answer("Этот счёт уже был успешно зачислен.", show_alert=True)
-        return
-
-    # Зачисление средств на кошелек
-    await db_transaction([
-        ("UPDATE topups SET status = 'completed' WHERE id = ?", (topup_id,)),
-        ("UPDATE users SET balance = balance + ? WHERE user_id = ?", (topup["amount"], user_id))
-    ])
-
-    await call.answer("✅ Баланс успешно пополнен!", show_alert=True)
-    await safe_edit_text(call.message, f"🎉 <b>Счёт №{topup_id} успешно оплачен!</b>\nНа ваш баланс зачислено <b>{topup['amount']:,.2f} ₽</b>.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# КАТАЛОГ С ПОДМЕНЮ (ПО СКРИНШОТАМ)
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(F.text == "🛍 Каталог товаров")
-async def show_catalog_categories(message: Message, state: FSMContext):
-    await state.clear()
-    await render_categories_menu(message)
-
-async def render_categories_menu(target: Message, is_edit: bool = False):
-    text = (
-        "🛍 <b>КАТАЛОГ ЦИФРОВЫХ ТОВАРОВ И АККАУНТОВ</b>\n"
-        "────────────────────────────\n"
-        "Выберите интересующую категорию площадки или соцсети:\n"
-        "<i>(Все покупки на 100% защищены Гарантом)</i>"
-    )
-
-    kb = []
-    # Формируем аккуратное меню в 2 колонки
-    row = []
-    for code, name in CATEGORIES:
-        row.append(InlineKeyboardButton(text=name, callback_data=f"cat_view:{code}:0"))
-        if len(row) == 2:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    if is_edit:
-        await safe_edit_text(target, text, reply_markup=reply_markup)
-    else:
-        await target.answer(text, reply_markup=reply_markup)
-
-@router.callback_query(F.data.startswith("cat_view:"))
-async def cb_cat_view(call: CallbackQuery):
-    _, cat_code, page_str = call.data.split(":")
-    page = int(page_str)
-    limit = 5
-    offset = page * limit
-
-    cat_name = CAT_DICT.get(cat_code, "Категория")
-
-    products = await db_get_all(
-        "SELECT * FROM products WHERE category = ? AND status = 'active' ORDER BY id DESC LIMIT ? OFFSET ?",
-        (cat_code, limit, offset)
-    )
-    total_row = await db_get_one("SELECT COUNT(*) as c FROM products WHERE category = ? AND status = 'active'", (cat_code,))
-    total_count = total_row["c"] if total_row else 0
-
-    if not products:
-        text = (
-            f"📁 <b>Раздел: {cat_name}</b>\n"
-            f"────────────────────────────\n"
-            f"В данной категории пока нет активных товаров.\n\n"
-            f"Вы можете выставить свой товар в эту категорию прямо сейчас в меню «📦 Мои товары»!"
+    for code, label in CATEGORIES:
+        current_row.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"{prefix}{code}",
+            )
         )
-        kb = [
-            [InlineKeyboardButton(text="➕ Выставить товар сюда", callback_data=f"add_prod_to:{cat_code}")],
-            [InlineKeyboardButton(text="◀️ Назад ко всем категориям", callback_data="back_to_categories")]
+
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Закрыть меню",
+                callback_data="close_menu",
+            )
         ]
-        await safe_edit_text(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-        await call.answer()
-        return
-
-    text = (
-        f"📁 <b>Раздел: {cat_name}</b>\n"
-        f"Товаров в наличии: <b>{total_count}</b> | Стр. {page + 1}\n"
-        f"────────────────────────────\n"
-        f"<i>Выберите товар для просмотра и покупки:</i>"
     )
 
-    kb = []
-    for p in products:
-        seller = await db_get_one("SELECT rating_sum, rating_count FROM users WHERE user_id = ?", (p["seller_id"],))
-        rating_val = f"★ {round(seller['rating_sum'] / seller['rating_count'], 1)}" if seller and seller["rating_count"] > 0 else "Новый"
-        btn_text = f"💎 {p['title'][:22]} — {p['price']:,.0f} ₽ ({rating_val})"
-        kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_prod:{p['id']}:{cat_code}:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # Пагинация
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat_view:{cat_code}:{page - 1}"))
-    if (offset + limit) < total_count:
-        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"cat_view:{cat_code}:{page + 1}"))
-    if nav_row:
-        kb.append(nav_row)
 
-    kb.append([InlineKeyboardButton(text="◀️ Ко всем категориям", callback_data="back_to_categories")])
-
-    await safe_edit_text(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await call.answer()
-
-@router.callback_query(F.data == "back_to_categories")
-async def cb_back_to_categories(call: CallbackQuery):
-    await render_categories_menu(call.message, is_edit=True)
-    await call.answer()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# КАРТОЧКА ТОВАРА И ПОКУПКА
-# ══════════════════════════════════════════════════════════════════════════════
-async def show_product_card(target_message: Message, prod_id: int, user_id: int, cat_code: str = "", page: int = 0, is_edit: bool = False):
-    p = await db_get_one("SELECT * FROM products WHERE id = ?", (prod_id,))
-    if not p or p["status"] != "active":
-        text = "❌ Товар был продан или снят с публикации."
-        if is_edit:
-            await safe_edit_text(target_message, text)
-        else:
-            await target_message.answer(text)
-        return
-
-    seller = await db_get_one("SELECT * FROM users WHERE user_id = ?", (p["seller_id"],))
-    rating_avg = round(seller["rating_sum"] / seller["rating_count"], 1) if seller and seller["rating_count"] > 0 else 5.0
-    reviews_cnt = seller["rating_count"] if seller else 0
-    pos_p = round((seller["pos_reviews"] / reviews_cnt) * 100) if reviews_cnt > 0 else 100
-    cat_name = CAT_DICT.get(p["category"], "Цифровой товар")
-
-    bot_info = await bot.get_me()
-    share_link = f"https://t.me/{bot_info.username}?start=item_{p['id']}"
-
-    text = (
-        f"💎 <b>КАРТОЧКА ТОВАРА #{p['id']}</b>\n"
-        f"📁 <b>Категория:</b> {cat_name}\n"
-        f"────────────────────────────\n"
-        f"📌 <b>Название:</b> {p['title']}\n"
-        f"💰 <b>Цена:</b> <b>{p['price']:,.2f} ₽</b>\n\n"
-        f"📝 <b>Описание:</b>\n{p['description']}\n"
-        f"────────────────────────────\n"
-        f"👤 <b>Продавец:</b> {seller['username']}\n"
-        f"⭐ <b>Репутация:</b> {rating_avg} / 5.0 | 👍 <b>{pos_p}%</b> положительных ({reviews_cnt} отзывов)\n"
-        f"🔗 <b>Прямая ссылка на лот:</b>\n<code>{share_link}</code>"
+async def answer_html(
+    message: Message,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> Any:
+    return await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
     )
 
-    kb = []
-    if user_id != p["seller_id"]:
-        kb.append([InlineKeyboardButton(text="💳 Купить через Гарант", callback_data=f"buy_prod:{p['id']}")])
-        kb.append([InlineKeyboardButton(text="💬 Задать вопрос продавцу", callback_data=f"ask_seller:{p['id']}")])
-        kb.append([InlineKeyboardButton(text="⭐ Отзывы о продавце", callback_data=f"view_seller_reviews:{p['seller_id']}")])
-    else:
-        kb.append([InlineKeyboardButton(text="🗑 Снять мой товар с продажи", callback_data=f"del_prod:{p['id']}")])
 
-    if cat_code:
-        kb.append([InlineKeyboardButton(text="◀️ Назад в категорию", callback_data=f"cat_view:{cat_code}:{page}")])
-    else:
-        kb.append([InlineKeyboardButton(text="◀️ В каталог", callback_data="back_to_categories")])
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    if is_edit:
-        await safe_edit_text(target_message, text, reply_markup=reply_markup)
-    else:
-        await target_message.answer(text, reply_markup=reply_markup)
-
-@router.callback_query(F.data.startswith("view_prod:"))
-async def cb_view_prod(call: CallbackQuery):
-    _, prod_id_str, cat_code, page_str = call.data.split(":")
-    await show_product_card(call.message, int(prod_id_str), call.from_user.id, cat_code=cat_code, page=int(page_str), is_edit=True)
-    await call.answer()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ПОКУПКА ТОВАРА: С БАЛАНСА КОШЕЛЬКА ИЛИ ЧЕРЕЗ ШЛЮЗ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.callback_query(F.data.startswith("buy_prod:"))
-async def cb_buy_prod(call: CallbackQuery):
-    prod_id = int(call.data.split(":")[1])
-    buyer_id = call.from_user.id
-    user = await get_or_create_user(buyer_id, call.from_user.username)
-
-    product = await db_get_one("SELECT * FROM products WHERE id = ?", (prod_id,))
-    if not product or product["status"] != "active":
-        await call.answer("Товар уже продан или недоступен.", show_alert=True)
-        return
-
-    if product["seller_id"] == buyer_id:
-        await call.answer("Нельзя купить собственный товар!", show_alert=True)
-        return
-
-    price = product["price"]
-    fee = round(price * COMMISSION_RATE, 2)
-    seller_receives = round(price - fee, 2)
-
-    # Создаем сделку
-    deal_id = await db_execute("""
-        INSERT INTO deals (product_id, buyer_id, seller_id, title, amount, fee, seller_receives, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting_payment', ?)
-    """, (product["id"], buyer_id, product["seller_id"], product["title"], price, fee, seller_receives, datetime.now().isoformat()))
-
-    # Проверяем, хватает ли средств на кошельке
-    kb = []
-    if user["balance"] >= price:
-        kb.append([InlineKeyboardButton(text=f"👛 Оплатить с Кошелька ({user['balance']:,.2f} ₽)", callback_data=f"pay_balance:{deal_id}")])
-
-    pay_url = f"https://app.paritypay.ru/pay/{PARITYPAY_SHOP_ID}?order_id=deal_{deal_id}&amount={price}"
-    kb.append([InlineKeyboardButton(text="💳 Оплатить через ParityPay", url=pay_url)])
-    kb.append([InlineKeyboardButton(text="✅ Проверить оплату шлюза", callback_data=f"check_pay:{deal_id}")])
-    kb.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_deal:{deal_id}")])
-
-    text = (
-        f"🛒 <b>ОФОРМЛЕНИЕ ЗАКАЗА ПО СДЕЛКЕ №{deal_id}</b>\n"
-        f"────────────────────────────\n"
-        f"📌 <b>Товар:</b> {product['title']}\n"
-        f"💰 <b>К оплате:</b> <b>{price:,.2f} ₽</b>\n"
-        f"👛 <b>Ваш баланс в Кошельке:</b> {user['balance']:,.2f} ₽\n\n"
-        f"Выберите способ оплаты:"
+async def send_html(
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> Any:
+    return await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
     )
 
-    await safe_edit_text(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await call.answer()
 
-@router.callback_query(F.data.startswith("pay_balance:"))
-async def cb_pay_balance(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    buyer_id = call.from_user.id
-    user = await get_or_create_user(buyer_id)
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or deal["buyer_id"] != buyer_id:
-        await call.answer("Сделка не найдена.", show_alert=True)
-        return
-
-    if deal["status"] != "waiting_payment":
-        await call.answer("Сделка уже оплачена или закрыта.", show_alert=True)
-        return
-
-    if user["balance"] < deal["amount"]:
-        await call.answer("Недостаточно средств на Кошельке!", show_alert=True)
-        return
-
-    # Списываем баланс покупателя и переводим сделку в paid
-    await db_transaction([
-        ("UPDATE users SET balance = balance - ? WHERE user_id = ?", (deal["amount"], buyer_id)),
-        ("UPDATE deals SET status = 'paid' WHERE id = ?", (deal_id,)),
-        ("UPDATE products SET status = 'sold' WHERE id = ?", (deal["product_id"],)) if deal["product_id"] else ("SELECT 1", ())
-    ])
-
-    await call.answer("✅ Успешно оплачено с баланса Кошелька!", show_alert=True)
-
-    # Оповещаем продавца
+async def safe_edit_message(
+    message: Message,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
     try:
-        await bot.send_message(
-            deal["seller_id"],
-            f"💰 <b>Покупатель оплатил сделку №{deal_id} с баланса Кошелька!</b>\n\n"
-            f"Средства заблокированы в Гаранте. Передайте товар Покупателю.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔎 Открыть сделку", callback_data=f"view_deal:{deal_id}")]
-            ])
+        await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+
+        try:
+            await answer_html(message, text, reply_markup)
+        except Exception:
+            logger.exception("Failed to edit and resend message")
+    except Exception:
+        logger.exception("Safe message edit failed")
+
+        try:
+            await answer_html(message, text, reply_markup)
+        except Exception:
+            logger.exception("Failed to resend message")
+
+
+async def answer_callback(
+    callback: CallbackQuery,
+    text: Optional[str] = None,
+    show_alert: bool = False,
+) -> None:
+    try:
+        await callback.answer(
+            text=text,
+            show_alert=show_alert,
         )
     except Exception:
         pass
 
-    await render_deal_view(call.message, deal_id, buyer_id, is_edit=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# МОИ ТОВАРЫ (КАБИНЕТ ПРОДАВЦА) С ВЫБОРОМ КАТЕГОРИИ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(F.text == "📦 Мои товары")
-async def show_seller_products(message: Message, state: FSMContext):
+def parse_callback_id(data: str, prefix: str) -> Optional[int]:
+    if not data.startswith(prefix):
+        return None
+
+    try:
+        return int(data[len(prefix):])
+    except ValueError:
+        return None
+
+
+def shorten(value: str, length: int = 45) -> str:
+    value = str(value)
+    if len(value) <= length:
+        return value
+    return value[: length - 1] + "…"
+
+
+def support_keyboard() -> list[list[InlineKeyboardButton]]:
+    if not SUPPORT_URL:
+        return []
+
+    return [
+        [
+            InlineKeyboardButton(
+                text=f"👨‍💻 Поддержка {SUPPORT_HANDLE}",
+                url=SUPPORT_URL,
+            )
+        ]
+    ]
+
+
+# =========================================================
+# MIDDLEWARE
+# =========================================================
+
+class MenuStateCleanerMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable,
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, Message) and event.text in MAIN_MENU_TEXTS:
+            state: Optional[FSMContext] = data.get("state")
+            if state:
+                await state.clear()
+
+        return await handler(event, data)
+
+
+dp.message.middleware(MenuStateCleanerMiddleware())
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def get_product_link(product_id: int) -> str:
+    global BOT_USERNAME
+
+    if not BOT_USERNAME:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username or ""
+
+    return f"https://t.me/{BOT_USERNAME}?start=item_{product_id}"
+
+
+@dp.message(CommandStart())
+async def command_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
     await state.clear()
-    user_id = message.from_user.id
-    await get_or_create_user(user_id, message.from_user.username)
 
-    products = await db_get_all("SELECT * FROM products WHERE seller_id = ? AND status = 'active' ORDER BY id DESC", (user_id,))
-    bot_info = await bot.get_me()
+    await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
 
-    kb = [[InlineKeyboardButton(text="➕ Выставить новый товар", callback_data="add_prod_select_cat")]]
+    args = (message.text or "").split(maxsplit=1)
+
+    if len(args) > 1 and args[1].startswith("item_"):
+        try:
+            product_id = int(args[1][5:])
+            await render_product_card(message, product_id)
+            return
+        except ValueError:
+            pass
+
+    text = (
+        "🛡 <b>Добро пожаловать в BastionPRO!</b>\n\n"
+        "Платформа безопасной торговли цифровыми товарами.\n\n"
+        "🛍 <b>Каталог</b> — просмотр предложений\n"
+        "📦 <b>Мои товары</b> — размещение товаров\n"
+        "👛 <b>Кошелёк</b> — внутренний баланс\n"
+        "📂 <b>Мои сделки</b> — история покупок и продаж\n"
+        "💳 <b>Вывод средств</b> — заявки продавцов\n\n"
+        f"Поддержка: {escape(SUPPORT_HANDLE)}"
+    )
+
+    await answer_html(
+        message,
+        text,
+        get_main_keyboard(),
+    )
+
+
+# =========================================================
+# MY PRODUCTS
+# =========================================================
+
+async def render_my_products_list(
+    target: Message | CallbackQuery,
+    user_id: int,
+) -> None:
+    products = await db_fetchall(
+        """
+        SELECT *
+        FROM products
+        WHERE seller_id = ?
+          AND status <> 'deleted'
+        ORDER BY id DESC
+        LIMIT 25
+        """,
+        (user_id,),
+    )
 
     if not products:
         text = (
-            "📦 <b>У вас пока нет активных товаров в каталоге.</b>\n\n"
-            "Вы можете выставить аккаунт или услугу прямо сейчас, получить прямую ссылку и скидывать её покупателям!"
+            "📦 <b>Ваши товары</b>\n\n"
+            "У вас пока нет товаров."
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="➕ Добавить товар",
+                        callback_data="add_product_start",
+                    )
+                ]
+            ]
         )
     else:
-        text = f"📦 <b>Ваши активные товары в продаже ({len(products)}):</b>\n\n"
-        for idx, p in enumerate(products, 1):
-            cat_name = CAT_DICT.get(p["category"], "Товар")
-            share_url = f"https://t.me/{bot_info.username}?start=item_{p['id']}"
-            text += (
-                f"{idx}. <b>{p['title']}</b> ({cat_name})\n"
-                f"   💰 Цена: {p['price']:,.2f} ₽ (Выплата: {p['price'] * 0.6:,.2f} ₽)\n"
-                f"   🔗 Ссылка: <code>{share_url}</code>\n\n"
+        lines = [f"📦 <b>Ваши товары ({len(products)})</b>\n"]
+        buttons: list[list[InlineKeyboardButton]] = []
+        has_sold = False
+
+        for product in products:
+            category = CATEGORIES_DICT.get(
+                product["category"],
+                product["category"],
             )
-            kb.append([InlineKeyboardButton(text=f"🗑 Снять #{p['id']} «{p['title'][:18]}»", callback_data=f"del_prod:{p['id']}")])
 
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+            lines.append(
+                f"{'🟢' if product['status'] == 'active' else '🔴'} "
+                f"<b>#{product['id']} {escape(product['title'])}</b>\n"
+                f"Платформа: {escape(category)}\n"
+                f"Цена: <b>{format_money(product['price_kopecks'])} ₽</b>\n"
+            )
 
-@router.callback_query(F.data == "add_prod_select_cat")
-async def cb_add_prod_cat(call: CallbackQuery, state: FSMContext):
-    text = "📁 <b>Шаг 1 из 4. Выберите категорию для вашего товара:</b>"
-    kb = []
-    row = []
-    for code, name in CATEGORIES:
-        row.append(InlineKeyboardButton(text=name, callback_data=f"set_prod_cat:{code}"))
-        if len(row) == 2:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
+            if product["status"] == "active":
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"⚙️ Управление #{product['id']}",
+                            callback_data=f"manage_p_{product['id']}",
+                        )
+                    ]
+                )
+            else:
+                has_sold = True
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"🗑 Удалить проданный #{product['id']}",
+                            callback_data=f"del_prod_{product['id']}",
+                        )
+                    ]
+                )
 
-    kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_fsm")])
-    await safe_edit_text(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await call.answer()
+        if has_sold:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="🧹 Очистить проданные",
+                        callback_data="clean_all_sold",
+                    )
+                ]
+            )
 
-@router.callback_query(F.data.startswith("set_prod_cat:"))
-async def cb_set_prod_cat(call: CallbackQuery, state: FSMContext):
-    cat_code = call.data.split(":")[1]
-    await state.update_data(category=cat_code)
-    await state.set_state(AddProductStates.title)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить товар",
+                    callback_data="add_product_start",
+                )
+            ]
+        )
 
-    cat_name = CAT_DICT.get(cat_code, "Категория")
-    await call.message.edit_text(
-        f"📁 Выбрана категория: <b>{cat_name}</b>\n\n"
-        f"📝 <b>Шаг 2 из 4. Введите название товара:</b>\n"
-        f"<i>Пример: Аккаунт с отлежкой 2 года / Telegram Premium 12 мес. / Prime CS2</i>"
-    )
+        text = "\n".join(lines)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-@router.message(AddProductStates.title)
-async def process_prod_title(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Добавление отменено.", reply_markup=get_main_keyboard())
-        return
+    if isinstance(target, CallbackQuery):
+        if target.message:
+            await safe_edit_message(
+                target.message,
+                text,
+                keyboard,
+            )
+    else:
+        await answer_html(target, text, keyboard)
 
-    if len(message.text) < 3 or len(message.text) > 100:
-        await message.answer("⚠️ Название должно быть от 3 до 100 символов. Введите снова:")
-        return
 
-    await state.update_data(title=message.text.strip())
-    await state.set_state(AddProductStates.description)
-    await message.answer(
-        "📝 <b>Шаг 3 из 4. Введите подробное описание:</b>\n\n"
-        "Укажите происхождение, формат выдачи данных, гарантию и инструкцию для покупателя:",
-        reply_markup=get_cancel_reply_kb()
-    )
-
-@router.message(AddProductStates.description)
-async def process_prod_desc(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
-        return
-
-    if len(message.text) < 5 or len(message.text) > 1000:
-        await message.answer("⚠️ Описание должно быть от 5 до 1000 символов. Введите снова:")
-        return
-
-    await state.update_data(description=message.text.strip())
-    await state.set_state(AddProductStates.price)
-    await message.answer(
-        "💰 <b>Шаг 4 из 4. Укажите стоимость для покупателя (в рублях):</b>\n\n"
-        "<i>(Минимум — 100 ₽. Вы получите 60% чистыми после закрытия сделки, 40% — комиссия гаранта)</i>",
-        reply_markup=get_cancel_reply_kb()
-    )
-
-@router.message(AddProductStates.price)
-async def process_prod_price(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
-        return
-
-    try:
-        price = float(message.text.replace(",", ".").strip())
-        if price < 100.0 or price > 1000000.0:
-            await message.answer("⚠️ Цена должна быть от 100 до 1 000 000 ₽. Введите число:")
-            return
-    except ValueError:
-        await message.answer("⚠️ Введите число (например: 1200):")
-        return
-
-    data = await state.get_data()
-    user_id = message.from_user.id
-    seller_receives = round(price * (1 - COMMISSION_RATE), 2)
-
-    prod_id = await db_execute("""
-        INSERT INTO products (seller_id, category, title, description, price, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'active', ?)
-    """, (user_id, data["category"], data["title"], data["description"], price, datetime.now().isoformat()))
-
+@dp.message(F.text == "📦 Мои товары")
+async def navigation_my_products(
+    message: Message,
+    state: FSMContext,
+) -> None:
     await state.clear()
-    bot_info = await bot.get_me()
-    share_link = f"https://t.me/{bot_info.username}?start=item_{prod_id}"
-    cat_name = CAT_DICT.get(data["category"], "Раздел")
+    await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    await render_my_products_list(message, message.from_user.id)
 
-    await message.answer(
-        f"🎉 <b>Товар #{prod_id} успешно опубликован в разделе {cat_name}!</b>\n\n"
-        f"📌 <b>Название:</b> {data['title']}\n"
-        f"💰 <b>Цена для покупателя:</b> {price:,.2f} ₽\n"
-        f"💼 <b>Ваша выплата:</b> <b>{seller_receives:,.2f} ₽</b> (за вычетом 40% комиссии)\n\n"
-        f"🔗 <b>Прямая ссылка для отправки покупателям:</b>\n"
-        f"👉 <code>{share_link}</code>\n\n"
-        f"<i>Отправьте эту ссылку клиенту или разместите в канале — он перейдет сразу к покупке через Гарант!</i>",
-        reply_markup=get_main_keyboard()
+
+@dp.callback_query(F.data.startswith("manage_p_"))
+async def manage_product(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    product_id = parse_callback_id(callback.data, "manage_p_")
+    if not product_id or not callback.message:
+        return
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
     )
 
-@router.callback_query(F.data.startswith("del_prod:"))
-async def cb_del_prod(call: CallbackQuery):
-    prod_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    prod = await db_get_one("SELECT * FROM products WHERE id = ?", (prod_id,))
-    if not prod or prod["seller_id"] != user_id:
-        await call.answer("Ошибка доступа.", show_alert=True)
+    if (
+        not product
+        or product["seller_id"] != callback.from_user.id
+        or product["status"] == "deleted"
+    ):
+        await answer_html(callback.message, "⚠️ Товар не найден.")
         return
 
-    await db_execute("UPDATE products SET status = 'deleted' WHERE id = ?", (prod_id,))
-    await call.answer("Товар снят с публикации.")
-    await safe_edit_text(call.message, f"🗑 Товар #{prod_id} снят с продажи.")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# КАРТОЧКА СДЕЛКИ И ИНСТРУКЦИИ
-# ══════════════════════════════════════════════════════════════════════════════
-async def render_deal_view(target_message: Message, deal_id: int, user_id: int, is_edit: bool = False):
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal:
-        text = "❌ Сделка не найдена."
-        if is_edit:
-            await safe_edit_text(target_message, text)
-        else:
-            await target_message.answer(text)
-        return
-
-    is_buyer = (user_id == deal["buyer_id"])
-    is_seller = (user_id == deal["seller_id"])
-    is_admin = (user_id == ADMIN_ID)
-
-    if not (is_buyer or is_seller or is_admin):
-        await target_message.answer("⚠️ Вы не являетесь участником этой сделки.")
-        return
-
-    status_map = {
-        "waiting_payment": "💳 Ожидание внесения оплаты Покупателем",
-        "paid": "🛡 Оплачено (средства заблокированы в гаранте)",
-        "shipped": "📦 Товар передан Продавцом (на проверке у Покупателя)",
-        "dispute": "⚖️ Открыт спор (в арбитраже)",
-        "completed": "✅ Сделка завершена",
-        "cancelled": "🚫 Сделка аннулирована"
-    }
-
-    my_role = "🔵 <b>Покупатель</b>" if is_buyer else ("🟢 <b>Продавец</b>" if is_seller else "👑 <b>Администратор</b>")
+    status = (
+        "🟢 На продаже"
+        if product["status"] == "active"
+        else "🔴 Продан"
+    )
+    link = await get_product_link(product_id)
 
     text = (
-        f"📋 <b>КАРТОЧКА СДЕЛКИ №{deal['id']}</b>\n"
-        f"────────────────────────────\n"
-        f"📌 <b>Предмет:</b> {deal['title']}\n"
-        f"💰 <b>Сумма сделки:</b> {deal['amount']:,.2f} ₽\n"
-        f"💼 <b>К выплате Продавцу:</b> {deal['seller_receives']:,.2f} ₽ <i>(комиссия сервиса 40%: {deal['fee']:,.2f} ₽)</i>\n"
-        f"🚦 <b>Статус:</b> {status_map.get(deal['status'], deal['status'])}\n"
-        f"👤 Ваша роль: {my_role}\n"
-        f"────────────────────────────\n"
+        f"⚙️ <b>Управление товаром #{product_id}</b>\n\n"
+        f"Название: <b>{escape(product['title'])}</b>\n"
+        f"Категория: {escape(CATEGORIES_DICT.get(product['category'], product['category']))}\n"
+        f"Цена: <b>{format_money(product['price_kopecks'])} ₽</b>\n"
+        f"Статус: {status}\n\n"
+        f"Ссылка:\n<code>{escape(link)}</code>"
     )
 
-    kb_buttons = []
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить товар",
+                    callback_data=f"del_prod_{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 Назад",
+                    callback_data="back_to_my_prods",
+                )
+            ],
+        ]
+    )
 
-    if deal["status"] == "waiting_payment":
-        if is_buyer:
-            user = await get_or_create_user(user_id)
-            if user["balance"] >= deal["amount"]:
-                kb_buttons.append([InlineKeyboardButton(text=f"👛 Оплатить с Кошелька ({user['balance']:,.2f} ₽)", callback_data=f"pay_balance:{deal['id']}")])
-            pay_url = f"https://app.paritypay.ru/pay/{PARITYPAY_SHOP_ID}?order_id=deal_{deal['id']}&amount={deal['amount']}"
-            kb_buttons.append([InlineKeyboardButton(text="💳 Оплатить через ParityPay", url=pay_url)])
-            kb_buttons.append([InlineKeyboardButton(text="✅ Проверить оплату шлюза", callback_data=f"check_pay:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"cancel_deal:{deal['id']}")])
-            text += "\n📖 <b>Инструкция для Покупателя:</b> Внесите оплату с баланса Кошелька или через шлюз. Деньги заморозятся у Гаранта."
-        elif is_seller:
-            kb_buttons.append([InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"cancel_deal:{deal['id']}")])
-            text += "\n⚠️ <b>ПАМЯТКА ДЛЯ ПРОДАВЦА: НЕ ПЕРЕДАВАЙТЕ ТОВАР СЕЙЧАС!</b> Дождитесь смены статуса на «🛡 Оплачено»."
+    await safe_edit_message(callback.message, text, keyboard)
 
-    elif deal["status"] == "paid":
-        if is_seller:
-            kb_buttons.append([InlineKeyboardButton(text="📦 Товар/услуга передана", callback_data=f"ship_deal:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="💬 Анонимный чат сделки", callback_data=f"open_chat:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"open_dispute:{deal['id']}")])
-            text += "\n💰 <b>Деньги в Гаранте!</b> Передайте товар Покупателю через анонимный чат и нажмите «Товар передан»."
-        elif is_buyer:
-            kb_buttons.append([InlineKeyboardButton(text="💬 Анонимный чат сделки", callback_data=f"open_chat:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"open_dispute:{deal['id']}")])
-            text += "\n🛡 <b>Деньги защищены Гарантом.</b> Ожидайте передачи данных от Продавца."
 
-    elif deal["status"] == "shipped":
-        if is_buyer:
-            kb_buttons.append([InlineKeyboardButton(text="✅ Подтвердить получение", callback_data=f"confirm_deal:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="💬 Анонимный чат сделки", callback_data=f"open_chat:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"open_dispute:{deal['id']}")])
-            text += "\n📦 <b>Продавец передал товар!</b> Проверьте работоспособность и подтвердите получение."
-        elif is_seller:
-            kb_buttons.append([InlineKeyboardButton(text="💬 Анонимный чат сделки", callback_data=f"open_chat:{deal['id']}")])
-            kb_buttons.append([InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"open_dispute:{deal['id']}")])
-            text += "\n⏳ <b>Товар на проверке у Покупателя.</b> Выплата поступит на ваш баланс после подтверждения."
+@dp.callback_query(F.data.startswith("del_prod_"))
+async def delete_product(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
 
-    elif deal["status"] == "dispute":
-        kb_buttons.append([InlineKeyboardButton(text="💬 Чат сделки", callback_data=f"open_chat:{deal['id']}")])
-        text += f"\n⚖️ <i>Сделка в арбитраже. Поддержка: {SUPPORT_HANDLE}</i>"
+    product_id = parse_callback_id(callback.data, "del_prod_")
+    if not product_id:
+        return
 
-    elif deal["status"] == "completed":
-        if is_buyer:
-            kb_buttons.append([InlineKeyboardButton(text="⭐ Оценить работу Продавца", callback_data=f"leave_review:{deal['id']}")])
-        text += "\n🎉 <i>Сделка успешно завершена.</i>"
+    deleted = await db_transaction(
+        _delete_product_tx,
+        product_id,
+        callback.from_user.id,
+    )
 
-    kb_buttons.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"view_deal:{deal['id']}")])
+    if not deleted:
+        await callback.message.answer("⚠️ Товар не найден или недоступен.")
+        return
 
-    if is_admin and deal["status"] == "dispute":
-        kb_buttons.append([
-            InlineKeyboardButton(text="👑 Вернуть Покупателю", callback_data=f"admin_refund:{deal['id']}"),
-            InlineKeyboardButton(text="👑 Выплатить Продавцу", callback_data=f"admin_payout:{deal['id']}")
-        ])
+    await answer_callback(callback, "Товар удалён")
 
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-    if is_edit:
-        await safe_edit_text(target_message, text, reply_markup=reply_markup)
+    if callback.message:
+        await render_my_products_list(
+            callback,
+            callback.from_user.id,
+        )
+
+
+@dp.callback_query(F.data == "clean_all_sold")
+async def clean_sold_products(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    await db_execute(
+        """
+        UPDATE products
+        SET status = 'deleted'
+        WHERE seller_id = ?
+          AND status = 'sold'
+        """,
+        (callback.from_user.id,),
+    )
+
+    await render_my_products_list(
+        callback,
+        callback.from_user.id,
+    )
+
+
+@dp.callback_query(F.data == "back_to_my_prods")
+async def back_to_my_products(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    await render_my_products_list(
+        callback,
+        callback.from_user.id,
+    )
+
+
+# =========================================================
+# WALLET AND PROFILE
+# =========================================================
+
+async def show_wallet(message: Message) -> None:
+    user = await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(
+                text="➕ Пополнить баланс",
+                callback_data="wallet_topup",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💳 Вывести средства",
+                callback_data="wallet_withdraw",
+            )
+        ],
+    ]
+    keyboard_rows.extend(support_keyboard())
+
+    text = (
+        "👛 <b>Кошелёк</b>\n\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Баланс: <b>{format_money(user['balance_kopecks'])} ₽</b>\n\n"
+        "<b>Комиссии:</b>\n"
+        f"• Пополнение: {rate_percent(BUYER_DEPOSIT_RATE)}\n"
+        f"• Сделка продавца: {rate_percent(SELLER_COMMISSION_RATE)}\n"
+        f"• Минимальный вывод: {format_money(MIN_WITHDRAW_KOPECKS)} ₽"
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
+
+
+@dp.message(F.text == "👛 Кошелёк")
+async def navigation_wallet(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    await show_wallet(message)
+
+
+@dp.callback_query(F.data == "open_wallet")
+async def open_wallet_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+    await state.clear()
+
+    if callback.message:
+        await show_wallet(callback.message)
+
+
+@dp.message(F.text == "👤 Профиль")
+async def navigation_profile(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    user = await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    completed = await db_fetchone(
+        """
+        SELECT COUNT(*) AS total
+        FROM deals
+        WHERE seller_id = ?
+          AND status = 'completed'
+        """,
+        (user["user_id"],),
+    )
+
+    if user["rating_count"]:
+        average = user["rating_sum"] / user["rating_count"]
+        positive = user["pos_reviews"] * 100 // user["rating_count"]
+        reputation = (
+            f"⭐ {average:.1f}/5.0, "
+            f"{positive}% положительных, "
+            f"{user['rating_count']} отзывов"
+        )
     else:
-        await target_message.answer(text, reply_markup=reply_markup)
+        reputation = "⭐ Новый участник, отзывов пока нет"
 
-@router.callback_query(F.data.startswith("view_deal:"))
-async def cb_view_deal(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    await render_deal_view(call.message, deal_id, call.from_user.id, is_edit=True)
-    await call.answer()
+    username = (
+        f"@{escape(user['username'])}"
+        if user["username"]
+        else "не указан"
+    )
 
-@router.callback_query(F.data.startswith("check_pay:"))
-async def cb_check_pay(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="👛 Кошелёк",
+                callback_data="open_wallet",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💳 Вывод средств",
+                callback_data="wallet_withdraw",
+            )
+        ],
+    ]
+    rows.extend(support_keyboard())
 
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or deal["buyer_id"] != user_id:
-        await call.answer("Только покупатель подтверждает оплату.", show_alert=True)
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"Telegram ID: <code>{user['user_id']}</code>\n"
+        f"Никнейм: {username}\n"
+        f"Баланс: <b>{format_money(user['balance_kopecks'])} ₽</b>\n"
+        f"Рейтинг: {escape(reputation)}\n"
+        f"Завершённых продаж: <b>{completed['total'] if completed else 0}</b>"
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+# =========================================================
+# WITHDRAWALS
+# =========================================================
+
+@dp.message(F.text == "💳 Вывод средств")
+async def navigation_withdraw(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    user = await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if user["balance_kopecks"] >= MIN_WITHDRAW_KOPECKS:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📤 Создать заявку",
+                    callback_data="start_withdraw",
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ Пополнить баланс",
+                    callback_data="wallet_topup",
+                )
+            ]
+        )
+
+    rows.extend(support_keyboard())
+
+    text = (
+        "💳 <b>Вывод средств</b>\n\n"
+        f"Доступно: <b>{format_money(user['balance_kopecks'])} ₽</b>\n"
+        f"Минимум: <b>{format_money(MIN_WITHDRAW_KOPECKS)} ₽</b>\n\n"
+        "Перед созданием заявки сумма временно резервируется. "
+        "При отклонении заявки средства возвращаются автоматически."
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "wallet_withdraw")
+@dp.callback_query(F.data == "start_withdraw")
+async def start_withdraw(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+    await state.clear()
+
+    user = await get_or_create_user(
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    if user["balance_kopecks"] < MIN_WITHDRAW_KOPECKS:
+        await callback.message.answer(
+            f"⚠️ Минимальная сумма вывода — "
+            f"{format_money(MIN_WITHDRAW_KOPECKS)} ₽."
+        )
         return
 
-    await db_execute("UPDATE deals SET status = 'paid' WHERE id = ?", (deal_id,))
-    if deal["product_id"]:
-        await db_execute("UPDATE products SET status = 'sold' WHERE id = ?", (deal["product_id"],))
+    await callback.message.answer(
+        "💳 Введите сумму вывода в рублях:"
+    )
+    await state.set_state(WithdrawFSM.amount)
 
-    await call.answer("✅ Оплата зафиксирована! Средства заблокированы в гаранте.", show_alert=True)
 
-    if deal["seller_id"]:
+@dp.message(WithdrawFSM.amount)
+async def process_withdraw_amount(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    try:
+        amount = parse_money(message.text or "")
+
+        if amount < MIN_WITHDRAW_KOPECKS:
+            raise ValueError(
+                f"Минимум — {format_money(MIN_WITHDRAW_KOPECKS)} ₽"
+            )
+    except ValueError as exc:
+        await message.answer(f"⚠️ {exc}")
+        return
+
+    user = await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    if amount > user["balance_kopecks"]:
+        await message.answer(
+            "⚠️ Недостаточно средств на балансе."
+        )
+        return
+
+    await state.update_data(withdraw_amount_kopecks=amount)
+
+    await message.answer(
+        "💳 Введите реквизиты для выплаты:\n"
+        "карта, СБП или криптокошелёк."
+    )
+    await state.set_state(WithdrawFSM.requisites)
+
+
+@dp.message(WithdrawFSM.requisites)
+async def process_withdraw_requisites(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    requisites = (message.text or "").strip()
+
+    if len(requisites) < 5 or len(requisites) > 500:
+        await message.answer(
+            "⚠️ Реквизиты должны содержать от 5 до 500 символов."
+        )
+        return
+
+    data = await state.get_data()
+    amount = int(data.get("withdraw_amount_kopecks", 0))
+
+    if amount <= 0:
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Создайте заявку заново.")
+        return
+
+    withdrawal_id = await db_transaction(
+        _create_withdrawal_tx,
+        message.from_user.id,
+        amount,
+        requisites,
+    )
+
+    if not withdrawal_id:
+        await state.clear()
+        await message.answer(
+            "⚠️ Баланс изменился. Недостаточно средств."
+        )
+        return
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Заявка <b>#{withdrawal_id}</b> создана.\n\n"
+        f"Сумма: <b>{format_money(amount)} ₽</b>\n"
+        f"Реквизиты: <code>{escape(mask_requisites(requisites))}</code>\n\n"
+        "Заявка ожидает проверки администратором.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard(),
+    )
+
+    user = await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    admin_text = (
+        f"🚨 <b>Новая заявка на вывод #{withdrawal_id}</b>\n\n"
+        f"Пользователь: @{escape(user['username']) or 'без username'}\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Сумма: <b>{format_money(amount)} ₽</b>\n"
+        f"Реквизиты:\n<code>{escape(requisites)}</code>"
+    )
+
+    admin_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Выплачено",
+                    callback_data=f"adm_w_ok_{withdrawal_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"adm_w_fail_{withdrawal_id}",
+                ),
+            ]
+        ]
+    )
+
+    for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(
-                deal["seller_id"],
-                f"💰 <b>Покупатель оплатил сделку №{deal_id}!</b>\n\n"
-                f"Средства в Гаранте. Передайте заказ Покупателю.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔎 Открыть сделку", callback_data=f"view_deal:{deal_id}")]
-                ])
+            await send_html(
+                admin_id,
+                admin_text,
+                admin_keyboard,
             )
         except Exception:
-            pass
-
-    await render_deal_view(call.message, deal_id, user_id, is_edit=True)
-
-@router.callback_query(F.data.startswith("ship_deal:"))
-async def cb_ship_deal(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or deal["seller_id"] != user_id:
-        await call.answer("Только продавец подтверждает отправку.", show_alert=True)
-        return
-
-    await db_execute("UPDATE deals SET status = 'shipped' WHERE id = ?", (deal_id,))
-    await call.answer("Покупатель уведомлен о передаче товара.")
-
-    if deal["buyer_id"]:
-        try:
-            await bot.send_message(
-                deal["buyer_id"],
-                f"📦 <b>Продавец передал товар по сделке №{deal_id}!</b>\nПроверьте выполнение и подтвердите получение.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔎 Открыть сделку", callback_data=f"view_deal:{deal_id}")]
-                ])
+            logger.exception(
+                "Failed to notify admin about withdrawal"
             )
-        except Exception:
-            pass
 
-    await render_deal_view(call.message, deal_id, user_id, is_edit=True)
 
-@router.callback_query(F.data.startswith("confirm_deal:"))
-async def cb_confirm_deal(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
+@dp.callback_query(F.data.startswith("adm_w_ok_"))
+async def approve_withdrawal(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
 
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or deal["buyer_id"] != user_id:
-        await call.answer("Только покупатель завершает сделку.", show_alert=True)
+    if not is_admin(callback.from_user.id):
+        await answer_callback(callback, "Нет доступа", True)
         return
 
-    if deal["status"] not in ["paid", "shipped"]:
-        await call.answer("Невозможно закрыть сделку в текущем статусе.", show_alert=True)
+    withdrawal_id = parse_callback_id(
+        callback.data,
+        "adm_w_ok_",
+    )
+    if not withdrawal_id:
         return
 
-    await db_transaction([
-        ("UPDATE users SET balance = balance + ? WHERE user_id = ?", (deal["seller_receives"], deal["seller_id"])),
-        ("INSERT INTO platform_vault (deal_id, fee_amount, created_at) VALUES (?, ?, ?)", (deal_id, deal["fee"], datetime.now().isoformat())),
-        ("UPDATE deals SET status = 'completed' WHERE id = ?", (deal_id,))
-    ])
+    withdrawal = await db_transaction(
+        _approve_withdrawal_tx,
+        withdrawal_id,
+    )
 
-    await call.answer("✅ Сделка успешно завершена! Продавец получил выплату.", show_alert=True)
-
-    if deal["seller_id"]:
-        try:
-            await bot.send_message(
-                deal["seller_id"],
-                f"🎉 <b>Сделка №{deal_id} успешно закрыта!</b>\n\n"
-                f"💰 На ваш баланс Кошелька начислено: <b>{deal['seller_receives']:,.2f} ₽</b> (за вычетом 40% комиссии).",
-                reply_markup=get_main_keyboard()
-            )
-        except Exception:
-            pass
-
-    await render_deal_view(call.message, deal_id, user_id, is_edit=True)
-
-@router.callback_query(F.data.startswith("cancel_deal:"))
-async def cb_cancel_deal(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or (deal["buyer_id"] != user_id and deal["seller_id"] != user_id):
-        await call.answer("Нет прав.", show_alert=True)
+    if not withdrawal:
+        await callback.message.answer(
+            "Заявка уже обработана или не найдена."
+        )
         return
 
-    if deal["status"] != "waiting_payment":
-        await call.answer("Оплаченную сделку нельзя отменить без арбитража!", show_alert=True)
-        return
-
-    await db_execute("UPDATE deals SET status = 'cancelled' WHERE id = ?", (deal_id,))
-    await call.answer("Сделка отменена.")
-    await render_deal_view(call.message, deal_id, user_id, is_edit=True)
-
-@router.callback_query(F.data.startswith("open_dispute:"))
-async def cb_open_dispute(call: CallbackQuery):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or (deal["buyer_id"] != user_id and deal["seller_id"] != user_id):
-        await call.answer("Нет прав.", show_alert=True)
-        return
-
-    if deal["status"] not in ["paid", "shipped"]:
-        await call.answer("Спор открывается только по оплаченной сделке.", show_alert=True)
-        return
-
-    await db_execute("UPDATE deals SET status = 'dispute' WHERE id = ?", (deal_id,))
-    await call.answer("⚖️ Дело передано в арбитраж администратору.", show_alert=True)
+    await safe_edit_message(
+        callback.message,
+        f"✅ Заявка #{withdrawal_id} отмечена как выплаченная.\n"
+        f"Сумма: <b>{format_money(withdrawal['amount_kopecks'])} ₽</b>",
+    )
 
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🚨 <b>ОТКРЫТ СПОР ПО СДЕЛКЕ №{deal_id}!</b>\nИнициатор: <code>{user_id}</code>\nСумма: <b>{deal['amount']:,.2f} ₽</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔎 Открыть сделку", callback_data=f"view_deal:{deal_id}")]
-            ])
+        await send_html(
+            withdrawal["user_id"],
+            f"✅ Заявка на вывод #{withdrawal_id} исполнена.\n"
+            f"Сумма: <b>{format_money(withdrawal['amount_kopecks'])} ₽</b>",
         )
     except Exception:
-        pass
+        logger.exception("Failed to notify user about completed withdrawal")
 
-    await render_deal_view(call.message, deal_id, user_id, is_edit=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# АНОНИМНЫЙ МЕДИА-ЧАТ И ПРЕДПРОДАЖНЫЕ ВОПРОСЫ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.callback_query(F.data.startswith("open_chat:"))
-async def cb_open_chat(call: CallbackQuery, state: FSMContext):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
+@dp.callback_query(F.data.startswith("adm_w_fail_"))
+async def reject_withdrawal(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
 
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or (deal["buyer_id"] != user_id and deal["seller_id"] != user_id):
-        await call.answer("Вы не участник сделки.", show_alert=True)
+    if not is_admin(callback.from_user.id):
+        await answer_callback(callback, "Нет доступа", True)
         return
 
-    await state.set_state(ChatProxyStates.in_chat)
-    await state.update_data(deal_id=deal_id)
-
-    role_label = "🔵 Покупатель" if user_id == deal["buyer_id"] else "🟢 Продавец"
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚪 Покинуть диалог")]], resize_keyboard=True)
-
-    await call.message.answer(
-        f"💬 <b>Анонимный чат по сделке №{deal_id} активирован!</b>\n"
-        f"Ваша роль: <b>{role_label}</b>\n\n"
-        f"Все текстовые сообщения, фото, файлы и голосовые пересылаются собеседнику анонимно.\n"
-        f"Для возврата в меню нажмите кнопку <b>«🚪 Покинуть диалог»</b>.",
-        reply_markup=kb
+    withdrawal_id = parse_callback_id(
+        callback.data,
+        "adm_w_fail_",
     )
-    await call.answer()
-
-@router.message(ChatProxyStates.in_chat, F.text == "🚪 Покинуть диалог")
-async def exit_proxy_chat(message: Message, state: FSMContext):
-    data = await state.get_data()
-    deal_id = data.get("deal_id")
-    await state.clear()
-    await message.answer("🚪 Вы покинули чат.", reply_markup=get_main_keyboard())
-    if deal_id:
-        await render_deal_view(message, deal_id, message.from_user.id)
-
-@router.message(ChatProxyStates.in_chat)
-async def proxy_relay(message: Message, state: FSMContext):
-    data = await state.get_data()
-    deal_id = data.get("deal_id")
-    user_id = message.from_user.id
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal:
-        await state.clear()
-        await message.answer("Сделка не найдена.", reply_markup=get_main_keyboard())
+    if not withdrawal_id:
         return
 
-    is_buyer = (user_id == deal["buyer_id"])
-    target_id = deal["seller_id"] if is_buyer else deal["buyer_id"]
-    prefix = "🔵 <b>[Покупатель]:</b>" if is_buyer else "🟢 <b>[Продавец]:</b>"
+    withdrawal = await db_transaction(
+        _reject_withdrawal_tx,
+        withdrawal_id,
+    )
 
-    if not target_id:
-        await message.answer("⚠️ Второй участник еще не подключился к сделке.")
+    if not withdrawal:
+        await callback.message.answer(
+            "Заявка уже обработана или не найдена."
+        )
         return
+
+    amount = withdrawal["amount_kopecks"]
+
+    await safe_edit_message(
+        callback.message,
+        f"❌ Заявка #{withdrawal_id} отклонена.\n"
+        f"Возвращено: <b>{format_money(amount)} ₽</b>",
+    )
 
     try:
-        if message.text:
-            await bot.send_message(target_id, f"{prefix} {message.text}")
-        elif message.photo:
-            cap = f"{prefix} {message.caption}" if message.caption else prefix
-            await bot.send_photo(target_id, message.photo[-1].file_id, caption=cap)
-        elif message.voice:
-            await bot.send_voice(target_id, message.voice.file_id, caption=prefix)
-        elif message.video_note:
-            await bot.send_message(target_id, f"{prefix} <i>(Видеосообщение ниже)</i>")
-            await bot.send_video_note(target_id, message.video_note.file_id)
-        elif message.document:
-            cap = f"{prefix} {message.caption}" if message.caption else prefix
-            await bot.send_document(target_id, message.document.file_id, caption=cap)
-    except Exception as e:
-        logger.error(f"Ошибка чата: {e}")
-        await message.answer("⚠️ Не удалось переслать сообщение собеседнику.")
+        await send_html(
+            withdrawal["user_id"],
+            f"❌ Заявка на вывод #{withdrawal_id} отклонена.\n"
+            f"Средства возвращены: <b>{format_money(amount)} ₽</b>",
+        )
+    except Exception:
+        logger.exception("Failed to notify user about rejected withdrawal")
 
-@router.callback_query(F.data.startswith("ask_seller:"))
-async def cb_ask_seller_init(call: CallbackQuery, state: FSMContext):
-    prod_id = int(call.data.split(":")[1])
-    product = await db_get_one("SELECT * FROM products WHERE id = ?", (prod_id,))
+
+# =========================================================
+# TOPUPS
+# =========================================================
+
+@dp.callback_query(F.data == "wallet_topup")
+async def start_topup(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+    await state.clear()
+
+    await callback.message.answer(
+        "👛 Введите сумму, которую нужно зачислить на баланс:"
+    )
+    await state.set_state(TopUpFSM.credit_amount)
+
+
+@dp.message(TopUpFSM.credit_amount)
+async def process_topup_amount(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    try:
+        credit = parse_money(message.text or "")
+
+        if credit < MIN_TOPUP_KOPECKS:
+            raise ValueError(
+                f"Минимум — {format_money(MIN_TOPUP_KOPECKS)} ₽"
+            )
+    except ValueError as exc:
+        await message.answer(f"⚠️ {exc}")
+        return
+
+    fee = calculate_fee(credit, BUYER_DEPOSIT_RATE)
+    total = credit + fee
+
+    topup_result = await db_execute(
+        """
+        INSERT INTO topups(
+            user_id,
+            credit_kopecks,
+            fee_kopecks,
+            total_kopecks,
+            status
+        )
+        VALUES (?, ?, ?, ?, 'pending')
+        """,
+        (
+            message.from_user.id,
+            credit,
+            fee,
+            total,
+        ),
+    )
+
+    topup_id = topup_result["lastrowid"]
+    payment_url = build_payment_url(topup_id, total)
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if payment_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Оплатить {format_money(total)} ₽",
+                    url=payment_url,
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Я оплатил",
+                callback_data=f"check_topup_{topup_id}",
+            )
+        ]
+    )
+    rows.extend(support_keyboard())
+
+    if payment_url:
+        payment_text = "Нажмите кнопку оплаты ниже."
+    else:
+        payment_text = (
+            "Платёжная ссылка пока не настроена. "
+            "Свяжитесь с администратором и укажите номер счёта."
+        )
+
+    await state.clear()
+
+    text = (
+        f"🧾 <b>Счёт #{topup_id}</b>\n\n"
+        f"Зачисление: <b>{format_money(credit)} ₽</b>\n"
+        f"Комиссия: <b>{format_money(fee)} ₽</b>\n"
+        f"К оплате: <b>{format_money(total)} ₽</b>\n\n"
+        f"{payment_text}"
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("check_topup_"))
+async def check_topup(callback: CallbackQuery) -> None:
+    await answer_callback(
+        callback,
+        "Заявка отправлена администратору",
+        show_alert=True,
+    )
+
+    topup_id = parse_callback_id(
+        callback.data,
+        "check_topup_",
+    )
+    if not topup_id:
+        return
+
+    topup = await db_fetchone(
+        "SELECT * FROM topups WHERE id = ?",
+        (topup_id,),
+    )
+
+    if not topup:
+        return
+
+    if topup["user_id"] != callback.from_user.id:
+        await answer_callback(callback, "Нет доступа", True)
+        return
+
+    if topup["status"] != "pending":
+        return
+
+    await db_execute(
+        """
+        UPDATE topups
+        SET check_requested_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """,
+        (topup_id,),
+    )
+
+    user = await get_or_create_user(
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    admin_text = (
+        f"🔔 <b>Проверка пополнения #{topup_id}</b>\n\n"
+        f"Пользователь: @{escape(user['username']) or 'без username'}\n"
+        f"ID: <code>{user['user_id']}</code>\n"
+        f"Зачислить: <b>{format_money(topup['credit_kopecks'])} ₽</b>\n"
+        f"Комиссия: <b>{format_money(topup['fee_kopecks'])} ₽</b>\n"
+        f"К оплате: <b>{format_money(topup['total_kopecks'])} ₽</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Зачислить",
+                    callback_data=f"adm_appr_topup_{topup_id}",
+                )
+            ]
+        ]
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_html(admin_id, admin_text, keyboard)
+        except Exception:
+            logger.exception("Failed to notify admin about topup")
+
+
+@dp.callback_query(F.data.startswith("adm_appr_topup_"))
+async def approve_topup(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    if not is_admin(callback.from_user.id):
+        await answer_callback(callback, "Нет доступа", True)
+        return
+
+    topup_id = parse_callback_id(
+        callback.data,
+        "adm_appr_topup_",
+    )
+    if not topup_id:
+        return
+
+    topup = await db_transaction(
+        _approve_topup_tx,
+        topup_id,
+    )
+
+    if not topup:
+        await callback.message.answer(
+            "Пополнение уже обработано или не найдено."
+        )
+        return
+
+    await safe_edit_message(
+        callback.message,
+        f"✅ Пополнение #{topup_id} зачислено.\n"
+        f"Баланс увеличен на "
+        f"<b>{format_money(topup['credit_kopecks'])} ₽</b>.",
+    )
+
+    try:
+        await send_html(
+            topup["user_id"],
+            "🎉 Баланс пополнен.\n"
+            f"Зачислено: <b>{format_money(topup['credit_kopecks'])} ₽</b>",
+            get_main_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to notify user about topup")
+
+
+# =========================================================
+# CATALOG
+# =========================================================
+
+@dp.message(F.text == "🛍 Каталог товаров")
+async def navigation_catalog(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    await answer_html(
+        message,
+        "🛍 <b>Каталог товаров</b>\n\nВыберите категорию:",
+        get_categories_keyboard("view"),
+    )
+
+
+@dp.callback_query(F.data.startswith("cat_v_"))
+async def view_category(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    if not callback.message:
+        return
+
+    category_code = callback.data.replace("cat_v_", "")
+    category_title = CATEGORIES_DICT.get(category_code)
+
+    if not category_title:
+        await answer_html(callback.message, "⚠️ Категория не найдена.")
+        return
+
+    products = await db_fetchall(
+        """
+        SELECT *
+        FROM products
+        WHERE category = ?
+          AND status = 'active'
+        ORDER BY id DESC
+        LIMIT 25
+        """,
+        (category_code,),
+    )
+
+    if not products:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="➕ Добавить свой товар",
+                        callback_data=f"cat_a_{category_code}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔙 Категории",
+                        callback_data="back_to_cats",
+                    )
+                ],
+            ]
+        )
+
+        await safe_edit_message(
+            callback.message,
+            f"{escape(category_title)}\n\n"
+            "В этой категории пока нет активных товаров.",
+            keyboard,
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for product in products:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=shorten(
+                        f"{product['title']} — "
+                        f"{format_money(product['price_kopecks'])} ₽",
+                        60,
+                    ),
+                    callback_data=f"view_prod_{product['id']}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="➕ Добавить товар",
+                callback_data=f"cat_a_{category_code}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Категории",
+                callback_data="back_to_cats",
+            )
+        ]
+    )
+
+    await safe_edit_message(
+        callback.message,
+        f"{escape(category_title)}\n\n"
+        f"Активных предложений: <b>{len(products)}</b>",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "back_to_cats")
+async def back_to_categories(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    await safe_edit_message(
+        callback.message,
+        "🛍 <b>Каталог товаров</b>\n\nВыберите категорию:",
+        get_categories_keyboard("view"),
+    )
+
+
+async def render_product_card(
+    target: Message | CallbackQuery,
+    product_id: int,
+) -> None:
+    product = await db_fetchone(
+        """
+        SELECT *
+        FROM products
+        WHERE id = ?
+          AND status <> 'deleted'
+        """,
+        (product_id,),
+    )
+
     if not product:
-        await call.answer("Товар не найден.", show_alert=True)
+        if isinstance(target, CallbackQuery) and target.message:
+            await answer_html(
+                target.message,
+                "⚠️ Товар не найден или удалён.",
+            )
+        elif isinstance(target, Message):
+            await answer_html(
+                target,
+                "⚠️ Товар не найден или удалён.",
+            )
         return
 
-    await state.set_state(AskSellerStates.question)
-    await state.update_data(product_id=prod_id, seller_id=product["seller_id"])
+    seller = await get_or_create_user(product["seller_id"])
 
-    await call.message.answer(
-        f"💬 <b>Вопрос продавцу по товару #{prod_id} «{product['title']}»</b>\n\n"
-        f"Напишите текст вопроса. Продавец получит уведомление и сможет ответить вам через бота:",
-        reply_markup=get_cancel_reply_kb()
-    )
-    await call.answer()
-
-@router.message(AskSellerStates.question)
-async def process_ask_seller_text(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
-        return
-
-    data = await state.get_data()
-    seller_id = data["seller_id"]
-    prod_id = data["product_id"]
-    buyer_id = message.from_user.id
-    q_text = message.text.strip()
-
-    await state.clear()
-    try:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✉️ Ответить покупателю", callback_data=f"reply_buyer:{buyer_id}:{prod_id}")]
-        ])
-        await bot.send_message(
-            seller_id,
-            f"🔔 <b>Вопрос от покупателя по товару #{prod_id}!</b>\n\n«{q_text}»",
-            reply_markup=kb
+    if seller["rating_count"]:
+        average = seller["rating_sum"] / seller["rating_count"]
+        reputation = (
+            f"⭐ {average:.1f}/5.0, "
+            f"{seller['rating_count']} отзывов"
         )
-        await message.answer("✅ Вопрос отправлен Продавцу! Ожидайте ответа.", reply_markup=get_main_keyboard())
-    except Exception:
-        await message.answer("⚠️ Не удалось отправить вопрос продавцу.", reply_markup=get_main_keyboard())
-
-@router.callback_query(F.data.startswith("reply_buyer:"))
-async def cb_reply_buyer_init(call: CallbackQuery, state: FSMContext):
-    _, buyer_id_str, prod_id_str = call.data.split(":")
-    await state.set_state(ReplyQuestionStates.reply_text)
-    await state.update_data(target_buyer_id=int(buyer_id_str), product_id=int(prod_id_str))
-
-    await call.message.answer("📝 Введите ваш ответ покупателю:", reply_markup=get_cancel_reply_kb())
-    await call.answer()
-
-@router.message(ReplyQuestionStates.reply_text)
-async def process_reply_buyer_send(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
-        return
-
-    data = await state.get_data()
-    buyer_id = data["target_buyer_id"]
-    prod_id = data["product_id"]
-    ans_text = message.text.strip()
-
-    await state.clear()
-    try:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Открыть товар", callback_data=f"view_prod:{prod_id}:0")],
-            [InlineKeyboardButton(text="💬 Задать еще вопрос", callback_data=f"ask_seller:{prod_id}")]
-        ])
-        await bot.send_message(
-            buyer_id,
-            f"💬 <b>Продавец ответил на ваш вопрос по товару #{prod_id}:</b>\n\n«{ans_text}»",
-            reply_markup=kb
-        )
-        await message.answer("✅ Ответ передан покупателю!", reply_markup=get_main_keyboard())
-    except Exception:
-        await message.answer("⚠️ Не удалось отправить ответ покупателю.", reply_markup=get_main_keyboard())
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ОТЗЫВЫ И РЕЙТИНГ (FUNPAY STYLE)
-# ══════════════════════════════════════════════════════════════════════════════
-@router.callback_query(F.data.startswith("leave_review:"))
-async def cb_leave_review(call: CallbackQuery, state: FSMContext):
-    deal_id = int(call.data.split(":")[1])
-    user_id = call.from_user.id
-
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-    if not deal or deal["buyer_id"] != user_id:
-        await call.answer("Только покупатель оставляет отзыв.", show_alert=True)
-        return
-
-    existing = await db_get_one("SELECT * FROM reviews WHERE deal_id = ?", (deal_id,))
-    if existing:
-        await call.answer("Отзыв уже оставлен.", show_alert=True)
-        return
-
-    await state.set_state(ReviewStates.rating)
-    await state.update_data(deal_id=deal_id, target_id=deal["seller_id"])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⭐ 1", callback_data="rate:1"),
-        InlineKeyboardButton(text="⭐ 2", callback_data="rate:2"),
-        InlineKeyboardButton(text="⭐ 3", callback_data="rate:3"),
-        InlineKeyboardButton(text="⭐ 4", callback_data="rate:4"),
-        InlineKeyboardButton(text="⭐ 5", callback_data="rate:5"),
-    ]])
-    await call.message.edit_text("⭐ <b>Оцените работу Продавца (1-5):</b>", reply_markup=kb)
-
-@router.callback_query(ReviewStates.rating, F.data.startswith("rate:"))
-async def cb_rate_score(call: CallbackQuery, state: FSMContext):
-    score = int(call.data.split(":")[1])
-    await state.update_data(rating=score)
-    await state.set_state(ReviewStates.comment)
-    await call.message.edit_text(f"Оценка: <b>{score} / 5 ⭐</b>\n\nНапишите текст отзыва (или отправьте «-»):")
-
-@router.message(ReviewStates.comment)
-async def process_review_comment(message: Message, state: FSMContext):
-    txt = message.text.strip()
-    comment = "Сделка прошла успешно!" if txt == "-" else txt
-    data = await state.get_data()
-    rating = data["rating"]
-    is_positive = 1 if rating >= 4 else 0
-
-    await db_transaction([
-        ("INSERT INTO reviews (deal_id, target_user_id, author_user_id, rating, comment, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-         (data["deal_id"], data["target_id"], message.from_user.id, rating, comment, datetime.now().isoformat())),
-        ("UPDATE users SET rating_sum = rating_sum + ?, rating_count = rating_count + 1, pos_reviews = pos_reviews + ? WHERE user_id = ?",
-         (rating, is_positive, data["target_id"]))
-    ])
-
-    await state.clear()
-    await message.answer("🎉 Спасибо! Ваш отзыв опубликован в профиле Продавца.", reply_markup=get_main_keyboard())
-
-@router.callback_query(F.data.startswith("view_seller_reviews:"))
-async def cb_view_seller_reviews(call: CallbackQuery):
-    seller_id = int(call.data.split(":")[1])
-    seller = await db_get_one("SELECT * FROM users WHERE user_id = ?", (seller_id,))
-    reviews = await db_get_all("SELECT * FROM reviews WHERE target_user_id = ? ORDER BY id DESC LIMIT 5", (seller_id,))
-
-    if not seller:
-        await call.answer("Продавец не найден.")
-        return
-
-    avg = round(seller["rating_sum"] / seller["rating_count"], 1) if seller["rating_count"] > 0 else 5.0
-    pos_p = round((seller["pos_reviews"] / seller["rating_count"]) * 100) if seller["rating_count"] > 0 else 100
-
-    text = (
-        f"⭐ <b>РЕПУТАЦИЯ ПРОДАВЦА {seller['username']}</b>\n"
-        f"────────────────────────────\n"
-        f"🌟 <b>Рейтинг:</b> {avg} / 5.0\n"
-        f"👍 <b>Положительных отзывов:</b> {pos_p}% ({seller['rating_count']} шт.)\n"
-        f"────────────────────────────\n"
-        f"<b>Последние отзывы клиентов:</b>\n\n"
-    )
-
-    if not reviews:
-        text += "<i>Пока нет отзывов. Станьте первым покупателем!</i>\n"
     else:
-        for r in reviews:
-            stars = "⭐" * r["rating"]
-            date_str = r["created_at"][:10]
-            text += f"{stars} ({date_str})\n«{r['comment']}»\n\n"
+        reputation = "⭐ Новый продавец"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад ко всем категориям", callback_data="back_to_categories")]])
-    await safe_edit_text(call.message, text, reply_markup=kb)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ПРОФИЛЬ, ВЫВОД И МОИ СДЕЛКИ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(F.text == "👤 Профиль")
-async def show_profile(message: Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    user = await get_or_create_user(user_id, message.from_user.username)
-
-    avg_rating = round(user["rating_sum"] / user["rating_count"], 1) if user["rating_count"] > 0 else 5.0
-    pos_p = round((user["pos_reviews"] / user["rating_count"]) * 100) if user["rating_count"] > 0 else 100
-    completed = await db_get_one(
-        "SELECT COUNT(*) as cnt FROM deals WHERE (buyer_id = ? OR seller_id = ?) AND status = 'completed'",
-        (user_id, user_id)
-    )
-    completed_cnt = completed["cnt"] if completed else 0
+    link = await get_product_link(product_id)
+    current_user_id = target.from_user.id
 
     text = (
-        f"👤 <b>ВАШ ПРОФИЛЬ НА ПЛОЩАДКЕ</b>\n"
-        f"────────────────────────────\n"
-        f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-        f"💰 <b>Баланс в Кошельке:</b> <b>{user['balance']:,.2f} ₽</b>\n"
-        f"⭐ <b>Рейтинг доверия:</b> {avg_rating} / 5.0 (👍 {pos_p}% положительных)\n"
-        f"💬 <b>Отзывов:</b> {user['rating_count']}\n"
-        f"🤝 <b>Завершённых сделок:</b> {completed_cnt}\n"
-        f"────────────────────────────"
+        f"📦 <b>{escape(product['title'])}</b>\n"
+        f"Категория: "
+        f"{escape(CATEGORIES_DICT.get(product['category'], product['category']))}\n"
+        f"Цена: <b>{format_money(product['price_kopecks'])} ₽</b>\n\n"
+        f"<b>Описание:</b>\n{escape(product['description'])}\n\n"
+        f"<b>Продавец:</b> "
+        f"@{escape(seller['username']) if seller['username'] else seller['user_id']}\n"
+        f"<b>Репутация:</b> {escape(reputation)}\n\n"
+        f"Ссылка:\n<code>{escape(link)}</code>"
     )
-    await message.answer(text, reply_markup=get_main_keyboard())
 
-@router.message(F.text == "📂 Мои сделки")
-async def show_my_deals(message: Message, state: FSMContext):
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if current_user_id == product["seller_id"]:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить товар",
+                    callback_data=f"del_prod_{product_id}",
+                )
+            ]
+        )
+    elif product["status"] == "active":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💳 Купить через гарант",
+                    callback_data=f"buy_item_{product_id}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💬 Задать вопрос",
+                    callback_data=f"ask_seller_{product_id}",
+                )
+            ]
+        )
+    else:
+        text += "\n\n⚠️ <b>Товар уже продан.</b>"
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Назад в каталог",
+                callback_data="back_to_cats",
+            )
+        ]
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if isinstance(target, CallbackQuery):
+        if target.message:
+            await safe_edit_message(
+                target.message,
+                text,
+                keyboard,
+            )
+    else:
+        await answer_html(target, text, keyboard)
+
+
+@dp.callback_query(F.data.startswith("view_prod_"))
+async def view_product(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    product_id = parse_callback_id(
+        callback.data,
+        "view_prod_",
+    )
+    if not product_id:
+        return
+
+    await render_product_card(callback, product_id)
+
+
+# =========================================================
+# ADD PRODUCT
+# =========================================================
+
+@dp.callback_query(F.data == "add_product_start")
+async def add_product_start(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    await callback.message.answer(
+        "➕ Выберите категорию товара:",
+        reply_markup=get_categories_keyboard("add"),
+    )
+
+
+@dp.callback_query(F.data.startswith("cat_a_"))
+async def select_product_category(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+
+    category_code = callback.data.replace("cat_a_", "")
+    category_title = CATEGORIES_DICT.get(category_code)
+
+    if not category_title:
+        await callback.message.answer("⚠️ Категория не найдена.")
+        return
+
     await state.clear()
-    user_id = message.from_user.id
-    deals = await db_get_all(
-        "SELECT * FROM deals WHERE (buyer_id = ? OR seller_id = ?) ORDER BY id DESC LIMIT 10",
-        (user_id, user_id)
+    await state.update_data(category=category_code)
+
+    await callback.message.answer(
+        f"Выбрано: <b>{escape(category_title)}</b>\n\n"
+        "Введите название товара от 3 до 100 символов.",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AddProductFSM.title)
+
+
+@dp.message(AddProductFSM.title)
+async def process_product_title(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    title = (message.text or "").strip()
+
+    if not 3 <= len(title) <= 100:
+        await message.answer(
+            "⚠️ Название должно содержать от 3 до 100 символов."
+        )
+        return
+
+    await state.update_data(title=title)
+
+    await message.answer(
+        "Введите подробное описание товара."
+    )
+    await state.set_state(AddProductFSM.description)
+
+
+@dp.message(AddProductFSM.description)
+async def process_product_description(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    description = (message.text or "").strip()
+
+    if not 5 <= len(description) <= 3000:
+        await message.answer(
+            "⚠️ Описание должно содержать от 5 до 3000 символов."
+        )
+        return
+
+    await state.update_data(description=description)
+
+    await message.answer(
+        "Введите цену товара в рублях."
+    )
+    await state.set_state(AddProductFSM.price)
+
+
+@dp.message(AddProductFSM.price)
+async def process_product_price(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    try:
+        price = parse_money(message.text or "")
+
+        if price < MIN_PRODUCT_PRICE_KOPECKS:
+            raise ValueError(
+                f"Минимальная цена — "
+                f"{format_money(MIN_PRODUCT_PRICE_KOPECKS)} ₽"
+            )
+    except ValueError as exc:
+        await message.answer(f"⚠️ {exc}")
+        return
+
+    data = await state.get_data()
+    category = data.get("category")
+    title = data.get("title")
+    description = data.get("description")
+
+    if not category or not title or not description:
+        await state.clear()
+        await message.answer(
+            "⚠️ Сессия добавления товара устарела."
+        )
+        return
+
+    await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    result = await db_execute(
+        """
+        INSERT INTO products(
+            seller_id,
+            category,
+            title,
+            description,
+            price_kopecks,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, 'active')
+        """,
+        (
+            message.from_user.id,
+            category,
+            title,
+            description,
+            price,
+        ),
+    )
+
+    product_id = result["lastrowid"]
+    link = await get_product_link(product_id)
+    seller_receives = price - calculate_fee(
+        price,
+        SELLER_COMMISSION_RATE,
+    )
+
+    await state.clear()
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="👀 Открыть карточку",
+                callback_data=f"view_prod_{product_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📦 Мои товары",
+                callback_data="back_to_my_prods",
+            )
+        ],
+    ]
+
+    text = (
+        f"🎉 <b>Товар #{product_id} опубликован!</b>\n\n"
+        f"Название: <b>{escape(title)}</b>\n"
+        f"Цена: <b>{format_money(price)} ₽</b>\n"
+        f"Ожидаемая выплата: "
+        f"<b>{format_money(seller_receives)} ₽</b>\n\n"
+        f"Ссылка:\n<code>{escape(link)}</code>"
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+# =========================================================
+# QUESTIONS TO SELLER
+# =========================================================
+
+@dp.callback_query(F.data.startswith("ask_seller_"))
+async def ask_seller_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+
+    product_id = parse_callback_id(
+        callback.data,
+        "ask_seller_",
+    )
+    if not product_id:
+        return
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    )
+
+    if not product or product["status"] == "deleted":
+        await callback.message.answer("⚠️ Товар недоступен.")
+        return
+
+    if product["seller_id"] == callback.from_user.id:
+        await callback.message.answer(
+            "⚠️ Нельзя задавать вопрос самому себе."
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        target_seller_id=product["seller_id"],
+        product_id=product_id,
+    )
+
+    await callback.message.answer(
+        f"💬 Вопрос по товару "
+        f"<b>{escape(product['title'])}</b>\n\n"
+        "Введите текст вопроса.",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(AskSellerFSM.question_text)
+
+
+@dp.message(AskSellerFSM.question_text)
+async def process_seller_question(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    question = (message.text or "").strip()
+
+    if not 2 <= len(question) <= 1000:
+        await message.answer(
+            "⚠️ Вопрос должен содержать от 2 до 1000 символов."
+        )
+        return
+
+    data = await state.get_data()
+    seller_id = int(data.get("target_seller_id", 0))
+    product_id = int(data.get("product_id", 0))
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    )
+
+    if not product or product["seller_id"] != seller_id:
+        await state.clear()
+        await message.answer("⚠️ Товар больше недоступен.")
+        return
+
+    try:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✉️ Ответить покупателю",
+                        callback_data=(
+                            f"reply_q_{message.from_user.id}_{product_id}"
+                        ),
+                    )
+                ]
+            ]
+        )
+
+        await send_html(
+            seller_id,
+            f"🔔 <b>Новый вопрос по товару #{product_id}</b>\n\n"
+            f"Товар: <b>{escape(product['title'])}</b>\n\n"
+            f"Вопрос:\n{escape(question)}",
+            keyboard,
+        )
+
+        await message.answer("✅ Вопрос отправлен продавцу.")
+    except Exception:
+        logger.exception("Failed to send seller question")
+        await message.answer(
+            "⚠️ Не удалось отправить вопрос продавцу."
+        )
+    finally:
+        await state.clear()
+
+
+@dp.callback_query(F.data.startswith("reply_q_"))
+async def reply_question_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+
+    parts = callback.data.split("_")
+
+    if len(parts) != 4:
+        return
+
+    try:
+        buyer_id = int(parts[2])
+        product_id = int(parts[3])
+    except ValueError:
+        return
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    )
+
+    if not product or product["seller_id"] != callback.from_user.id:
+        await callback.message.answer("⚠️ Нет доступа к этому вопросу.")
+        return
+
+    await state.clear()
+    await state.update_data(
+        target_buyer_id=buyer_id,
+        product_id=product_id,
+    )
+
+    await callback.message.answer(
+        "Введите ответ покупателю."
+    )
+    await state.set_state(AnswerBuyerFSM.answer_text)
+
+
+@dp.message(AnswerBuyerFSM.answer_text)
+async def process_seller_answer(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    answer = (message.text or "").strip()
+
+    if not 1 <= len(answer) <= 2000:
+        await message.answer(
+            "⚠️ Ответ должен содержать от 1 до 2000 символов."
+        )
+        return
+
+    data = await state.get_data()
+    buyer_id = int(data.get("target_buyer_id", 0))
+    product_id = int(data.get("product_id", 0))
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    )
+
+    if not product or product["seller_id"] != message.from_user.id:
+        await state.clear()
+        await message.answer("⚠️ Нет доступа к этому товару.")
+        return
+
+    try:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="👀 Открыть товар",
+                        callback_data=f"view_prod_{product_id}",
+                    )
+                ]
+            ]
+        )
+
+        await send_html(
+            buyer_id,
+            f"📩 <b>Ответ продавца</b>\n\n"
+            f"Товар: <b>{escape(product['title'])}</b>\n\n"
+            f"{escape(answer)}",
+            keyboard,
+        )
+
+        await message.answer("✅ Ответ отправлен.")
+    except Exception:
+        logger.exception("Failed to send seller answer")
+        await message.answer(
+            "⚠️ Не удалось отправить ответ покупателю."
+        )
+    finally:
+        await state.clear()
+
+
+# =========================================================
+# ESCROW DEALS
+# =========================================================
+
+@dp.callback_query(F.data.startswith("buy_item_"))
+async def buy_item(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    product_id = parse_callback_id(
+        callback.data,
+        "buy_item_",
+    )
+    if not product_id:
+        return
+
+    product = await db_fetchone(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    )
+
+    if not product or product["status"] != "active":
+        await callback.message.answer(
+            "⚠️ Товар уже недоступен."
+        )
+        return
+
+    if product["seller_id"] == callback.from_user.id:
+        await callback.message.answer(
+            "⚠️ Нельзя купить собственный товар."
+        )
+        return
+
+    buyer = await get_or_create_user(
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    price = product["price_kopecks"]
+
+    if buyer["balance_kopecks"] < price:
+        missing = price - buyer["balance_kopecks"]
+        fee = calculate_fee(missing, BUYER_DEPOSIT_RATE)
+
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="👛 Пополнить баланс",
+                    callback_data="wallet_topup",
+                )
+            ]
+        ]
+
+        text = (
+            "⚠️ <b>Недостаточно средств</b>\n\n"
+            f"Цена: <b>{format_money(price)} ₽</b>\n"
+            f"Баланс: <b>{format_money(buyer['balance_kopecks'])} ₽</b>\n"
+            f"Не хватает: <b>{format_money(missing)} ₽</b>\n"
+            f"Комиссия пополнения: <b>{format_money(fee)} ₽</b>\n"
+            f"К оплате: <b>{format_money(missing + fee)} ₽</b>"
+        )
+
+        await answer_html(
+            callback.message,
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"✅ Подтвердить оплату {format_money(price)} ₽",
+                callback_data=f"confirm_pay_{product_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="close_menu",
+            )
+        ],
+    ]
+
+    text = (
+        "🛡 <b>Подтверждение безопасной сделки</b>\n\n"
+        f"Товар: <b>{escape(product['title'])}</b>\n"
+        f"Сумма: <b>{format_money(price)} ₽</b>\n"
+        f"Баланс после оплаты: "
+        f"<b>{format_money(buyer['balance_kopecks'] - price)} ₽</b>\n\n"
+        "Деньги будут удерживаться до подтверждения получения."
+    )
+
+    await answer_html(
+        callback.message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_pay_"))
+async def confirm_payment(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    product_id = parse_callback_id(
+        callback.data,
+        "confirm_pay_",
+    )
+    if not product_id:
+        return
+
+    await get_or_create_user(
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    deal = await db_transaction(
+        _create_deal_tx,
+        product_id,
+        callback.from_user.id,
+    )
+
+    if not deal:
+        await callback.message.answer(
+            "⚠️ Товар уже куплен или недостаточно средств."
+        )
+        return
+
+    buyer = await get_or_create_user(
+        callback.from_user.id,
+        callback.from_user.username,
+    )
+
+    buyer_text = (
+        f"🎉 <b>Сделка #{deal['deal_id']} создана</b>\n\n"
+        f"Товар: <b>{escape(deal['title'])}</b>\n"
+        f"Заморожено: <b>{format_money(deal['amount_kopecks'])} ₽</b>\n\n"
+        "Ожидайте передачу товара от продавца. "
+        "После проверки подтвердите получение."
+    )
+
+    buyer_rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить получение",
+                callback_data=f"buyer_done_{deal['deal_id']}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⚠️ Открыть спор",
+                callback_data=f"deal_dispute_{deal['deal_id']}",
+            )
+        ]
+    ]
+    buyer_rows.extend(support_keyboard())
+
+    await safe_edit_message(
+        callback.message,
+        buyer_text,
+        InlineKeyboardMarkup(inline_keyboard=buyer_rows),
+    )
+
+    seller_text = (
+        f"🚨 <b>Товар оплачен — сделка #{deal['deal_id']}</b>\n\n"
+        f"Товар: <b>{escape(deal['title'])}</b>\n"
+        f"Сумма: <b>{format_money(deal['amount_kopecks'])} ₽</b>\n"
+        f"Ваша выплата: "
+        f"<b>{format_money(deal['seller_receives_kopecks'])} ₽</b>\n\n"
+        "Передайте данные товара покупателю."
+    )
+
+    try:
+        await send_html(
+            deal["seller_id"],
+            seller_text,
+        )
+    except Exception:
+        logger.exception("Failed to notify seller")
+
+    del buyer
+
+
+@dp.callback_query(F.data.startswith("buyer_done_"))
+async def buyer_confirm_delivery(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    deal_id = parse_callback_id(
+        callback.data,
+        "buyer_done_",
+    )
+    if not deal_id:
+        return
+
+    deal = await db_transaction(
+        _complete_deal_tx,
+        deal_id,
+        callback.from_user.id,
+    )
+
+    if not deal:
+        await callback.message.answer(
+            "⚠️ Сделка уже завершена, отменена или недоступна."
+        )
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="⭐ 1",
+                callback_data=f"rate_{deal_id}_1",
+            ),
+            InlineKeyboardButton(
+                text="⭐ 2",
+                callback_data=f"rate_{deal_id}_2",
+            ),
+            InlineKeyboardButton(
+                text="⭐ 3",
+                callback_data=f"rate_{deal_id}_3",
+            ),
+            InlineKeyboardButton(
+                text="⭐ 4",
+                callback_data=f"rate_{deal_id}_4",
+            ),
+            InlineKeyboardButton(
+                text="⭐ 5",
+                callback_data=f"rate_{deal_id}_5",
+            ),
+        ]
+    ]
+
+    await safe_edit_message(
+        callback.message,
+        f"✅ <b>Сделка #{deal_id} завершена.</b>\n\n"
+        "Оцените продавца:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+    seller_rows = [
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить проданный товар",
+                callback_data=f"del_prod_{deal['product_id']}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💳 Вывести средства",
+                callback_data="wallet_withdraw",
+            )
+        ],
+    ]
+
+    try:
+        await send_html(
+            deal["seller_id"],
+            f"🎉 Сделка #{deal_id} завершена.\n\n"
+            f"Зачислено: "
+            f"<b>{format_money(deal['seller_receives_kopecks'])} ₽</b>",
+            InlineKeyboardMarkup(inline_keyboard=seller_rows),
+        )
+    except Exception:
+        logger.exception("Failed to notify seller about completion")
+
+
+@dp.callback_query(F.data.startswith("deal_dispute_"))
+async def open_deal_dispute(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    deal_id = parse_callback_id(
+        callback.data,
+        "deal_dispute_",
+    )
+    if not deal_id:
+        return
+
+    deal, changed = await db_transaction(
+        _open_dispute_tx,
+        deal_id,
+        callback.from_user.id,
+    )
+
+    if not deal:
+        await callback.message.answer(
+            "⚠️ Сделка не найдена или у вас нет доступа."
+        )
+        return
+
+    if not changed:
+        await callback.message.answer(
+            "⚠️ Спор уже открыт или сделка больше не может быть оспорена."
+        )
+        return
+
+    rows = []
+    rows.extend(support_keyboard())
+
+    await safe_edit_message(
+        callback.message,
+        f"⚠️ <b>По сделке #{deal_id} открыт спор.</b>\n\n"
+        "Средства остаются заблокированными до решения администратора.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+    admin_text = (
+        f"🚨 <b>Открыт спор по сделке #{deal_id}</b>\n\n"
+        f"Товар: <b>{escape(deal['title'])}</b>\n"
+        f"Сумма: <b>{format_money(deal['amount_kopecks'])} ₽</b>\n"
+        f"Покупатель: <code>{deal['buyer_id']}</code>\n"
+        f"Продавец: <code>{deal['seller_id']}</code>"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_html(admin_id, admin_text)
+        except Exception:
+            logger.exception("Failed to notify admin about dispute")
+
+
+# =========================================================
+# DEALS LIST AND REVIEWS
+# =========================================================
+
+DEAL_STATUS_LABELS = {
+    "created": "⏳ Создана",
+    "paid": "🔒 Оплачена",
+    "completed": "✅ Завершена",
+    "dispute": "⚠️ Спор",
+    "cancelled": "❌ Отменена",
+    "refunded": "↩️ Возвращена",
+}
+
+
+@dp.message(F.text == "📂 Мои сделки")
+async def navigation_deals(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    await get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    deals = await db_fetchall(
+        """
+        SELECT *
+        FROM deals
+        WHERE buyer_id = ? OR seller_id = ?
+        ORDER BY id DESC
+        LIMIT 25
+        """,
+        (
+            message.from_user.id,
+            message.from_user.id,
+        ),
     )
 
     if not deals:
-        await message.answer("У вас пока нет активных или завершенных сделок.", reply_markup=get_main_keyboard())
-        return
-
-    kb = []
-    for d in deals:
-        ico = "🔵" if d["buyer_id"] == user_id else "🟢"
-        btn_text = f"{ico} №{d['id']} — {d['title'][:20]} ({d['amount']:,.0f} ₽)"
-        kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_deal:{d['id']}")])
-
-    await message.answer("📂 <b>Ваши последние сделки:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data == "wallet_withdraw")
-@router.message(F.text == "💳 Вывод средств")
-async def start_withdraw(event: Any, state: FSMContext):
-    await state.clear()
-    user_id = event.from_user.id
-    user = await get_or_create_user(user_id)
-
-    if user["balance"] < MIN_WITHDRAW:
-        msg_text = (
-            f"💳 <b>Вывод средств с Кошелька</b>\n\n"
-            f"Ваш текущий баланс: <b>{user['balance']:,.2f} ₽</b>\n"
-            f"Минимальная сумма к выводу: <b>{MIN_WITHDRAW:,.2f} ₽</b>\n\n"
-            f"📅 <b>График выплат:</b> Выплаты производятся <b>каждый вторник и четверг</b>."
+        await message.answer(
+            "📂 Сделок пока нет."
         )
-        if isinstance(event, CallbackQuery):
-            await event.answer("Недостаточно средств для вывода.", show_alert=True)
-            await event.message.answer(msg_text)
-        else:
-            await event.answer(msg_text)
         return
 
-    await state.set_state(WithdrawStates.amount)
-    prompt = f"💳 Введите сумму к выводу (доступно: <b>{user['balance']:,.2f} ₽</b>, мин: {MIN_WITHDRAW:,.0f} ₽):"
-    if isinstance(event, CallbackQuery):
-        await event.message.answer(prompt, reply_markup=get_cancel_reply_kb())
-        await event.answer()
-    else:
-        await event.answer(prompt, reply_markup=get_cancel_reply_kb())
+    lines = ["📂 <b>Мои сделки</b>\n"]
+    rows: list[list[InlineKeyboardButton]] = []
 
-@router.message(WithdrawStates.amount)
-async def process_withdraw_amount(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
+    for deal in deals:
+        role = (
+            "Покупатель"
+            if deal["buyer_id"] == message.from_user.id
+            else "Продавец"
+        )
+
+        lines.append(
+            f"🤝 <b>#{deal['id']}</b> — {role}\n"
+            f"{escape(deal['title'])}\n"
+            f"Сумма: <b>{format_money(deal['amount_kopecks'])} ₽</b>\n"
+            f"Статус: {DEAL_STATUS_LABELS.get(deal['status'], deal['status'])}\n"
+        )
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Открыть сделку #{deal['id']}",
+                    callback_data=f"deal_open_{deal['id']}",
+                )
+            ]
+        )
+
+    await answer_html(
+        message,
+        "\n".join(lines),
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("deal_open_"))
+async def open_deal(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
+
+    deal_id = parse_callback_id(
+        callback.data,
+        "deal_open_",
+    )
+    if not deal_id:
         return
 
-    user = await get_or_create_user(message.from_user.id)
+    deal = await db_fetchone(
+        "SELECT * FROM deals WHERE id = ?",
+        (deal_id,),
+    )
+
+    if not deal:
+        await callback.message.answer("⚠️ Сделка не найдена.")
+        return
+
+    user_id = callback.from_user.id
+
+    if user_id not in (deal["buyer_id"], deal["seller_id"]):
+        await callback.message.answer(
+            "⚠️ У вас нет доступа к этой сделке."
+        )
+        return
+
+    role = (
+        "Покупатель"
+        if deal["buyer_id"] == user_id
+        else "Продавец"
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if role == "Покупатель" and deal["status"] == "paid":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить получение",
+                    callback_data=f"buyer_done_{deal_id}",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⚠️ Открыть спор",
+                    callback_data=f"deal_dispute_{deal_id}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Закрыть",
+                callback_data="close_menu",
+            )
+        ]
+    )
+
+    text = (
+        f"🤝 <b>Сделка #{deal_id}</b>\n\n"
+        f"Роль: <b>{role}</b>\n"
+        f"Товар: <b>{escape(deal['title'])}</b>\n"
+        f"Сумма: <b>{format_money(deal['amount_kopecks'])} ₽</b>\n"
+        f"Статус: "
+        f"<b>{DEAL_STATUS_LABELS.get(deal['status'], deal['status'])}</b>"
+    )
+
+    await answer_html(
+        callback.message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("rate_"))
+async def rate_seller(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await answer_callback(callback)
+
+    parts = callback.data.split("_")
+
+    if len(parts) != 3:
+        return
+
     try:
-        val = float(message.text.replace(",", ".").strip())
-        if val < MIN_WITHDRAW or val > user["balance"]:
-            await message.answer(f"⚠️ Сумма должна быть от {MIN_WITHDRAW:,.0f} до {user['balance']:,.2f} ₽. Введите снова:")
-            return
+        deal_id = int(parts[1])
+        rating = int(parts[2])
     except ValueError:
-        await message.answer("⚠️ Введите число:")
         return
 
-    await state.update_data(amount=val)
-    await state.set_state(WithdrawStates.requisites)
-    await message.answer("💳 <b>Введите номер карты банка РФ или СБП с указанием банка:</b>")
+    if not 1 <= rating <= 5:
+        return
 
-@router.message(WithdrawStates.requisites)
-async def process_withdraw_reqs(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=get_main_keyboard())
+    deal = await db_fetchone(
+        "SELECT * FROM deals WHERE id = ?",
+        (deal_id,),
+    )
+
+    if (
+        not deal
+        or deal["buyer_id"] != callback.from_user.id
+        or deal["status"] != "completed"
+    ):
+        await callback.message.answer(
+            "⚠️ Оценка недоступна."
+        )
+        return
+
+    existing = await db_fetchone(
+        """
+        SELECT id
+        FROM reviews
+        WHERE deal_id = ?
+          AND author_user_id = ?
+        """,
+        (
+            deal_id,
+            callback.from_user.id,
+        ),
+    )
+
+    if existing:
+        await callback.message.answer(
+            "Вы уже оценили эту сделку."
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        deal_id=deal_id,
+        rating=rating,
+    )
+
+    await safe_edit_message(
+        callback.message,
+        f"⭐ Вы выбрали оценку <b>{rating}/5</b>.\n\n"
+        "Введите комментарий или отправьте символ «-».",
+    )
+    await state.set_state(ReviewFSM.comment)
+
+
+@dp.message(ReviewFSM.comment)
+async def process_review(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    comment = (message.text or "").strip()
+
+    if comment == "-":
+        comment = ""
+
+    if len(comment) > 2000:
+        await message.answer(
+            "⚠️ Отзыв не должен превышать 2000 символов."
+        )
         return
 
     data = await state.get_data()
-    amount = data["amount"]
-    requisites = message.text.strip()
-    user_id = message.from_user.id
+    deal_id = int(data.get("deal_id", 0))
+    rating = int(data.get("rating", 0))
 
-    await db_transaction([
-        ("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id)),
-        ("INSERT INTO withdrawals (user_id, amount, requisites, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
-         (user_id, amount, requisites, datetime.now().isoformat()))
-    ])
+    if not deal_id or not 1 <= rating <= 5:
+        await state.clear()
+        await message.answer("⚠️ Сессия оценки устарела.")
+        return
+
+    saved = await db_transaction(
+        _complete_review_tx,
+        deal_id,
+        message.from_user.id,
+        rating,
+        comment,
+    )
 
     await state.clear()
+
+    if not saved:
+        await message.answer(
+            "⚠️ Отзыв уже существует или недоступен."
+        )
+        return
+
     await message.answer(
-        f"✅ <b>Заявка на вывод средств зарегистрирована!</b>\n\n"
-        f"Сумма: <b>{amount:,.2f} ₽</b>\n"
-        f"Реквизиты: <code>{requisites}</code>\n\n"
-        f"📅 Средства поступят в ближайший расчетный день (<b>вторник</b> или <b>четверг</b>).",
-        reply_markup=get_main_keyboard()
+        "🙏 Спасибо за отзыв!",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+# =========================================================
+# PARTNERS AND HELP
+# =========================================================
+
+@dp.message(F.text == "🌐 Подключить OnyxVPN")
+async def navigation_onyxvpn(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    await answer_html(
+        message,
+        "🌐 <b>OnyxVPN</b>\n\n"
+        "Партнёрский сервис VPN.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🚀 Открыть OnyxVPN",
+                        url=ONYX_VPN_URL,
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@dp.message(F.text == "ℹ️ Помощь / Поддержка")
+async def navigation_help(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+
+    rows = []
+    rows.extend(support_keyboard())
+
+    text = (
+        "ℹ️ <b>Помощь</b>\n\n"
+        "<b>Безопасная сделка:</b>\n"
+        "1. Покупатель оплачивает товар с баланса.\n"
+        "2. Средства блокируются.\n"
+        "3. Продавец передаёт товар.\n"
+        "4. Покупатель подтверждает получение.\n"
+        "5. Продавец получает выплату.\n\n"
+        "<b>Комиссии:</b>\n"
+        f"• Пополнение: {rate_percent(BUYER_DEPOSIT_RATE)}\n"
+        f"• Комиссия продавца: {rate_percent(SELLER_COMMISSION_RATE)}\n"
+        f"• Минимальный вывод: "
+        f"{format_money(MIN_WITHDRAW_KOPECKS)} ₽"
+    )
+
+    await answer_html(
+        message,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+@dp.message(Command("admin"))
+async def admin_dashboard(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    vault = await db_fetchone(
+        "SELECT COALESCE(SUM(fee_kopecks), 0) AS total FROM platform_vault"
+    )
+    topup_fees = await db_fetchone(
+        """
+        SELECT COALESCE(SUM(fee_kopecks), 0) AS total
+        FROM platform_vault
+        WHERE source_type = 'buyer_topup_fee'
+        """
+    )
+    deal_fees = await db_fetchone(
+        """
+        SELECT COALESCE(SUM(fee_kopecks), 0) AS total
+        FROM platform_vault
+        WHERE source_type = 'seller_deal_fee'
+        """
+    )
+    pending_withdrawals = await db_fetchone(
+        """
+        SELECT COUNT(*) AS total
+        FROM withdrawals
+        WHERE status = 'pending'
+        """
+    )
+    active_products = await db_fetchone(
+        """
+        SELECT COUNT(*) AS total
+        FROM products
+        WHERE status = 'active'
+        """
+    )
+
+    text = (
+        "👑 <b>Административная панель</b>\n\n"
+        f"Казна: <b>{format_money(vault['total'])} ₽</b>\n"
+        f"Пополнения: <b>{format_money(topup_fees['total'])} ₽</b>\n"
+        f"Сделки: <b>{format_money(deal_fees['total'])} ₽</b>\n\n"
+        f"Активных товаров: <b>{active_products['total']}</b>\n"
+        f"Заявок на вывод: <b>{pending_withdrawals['total']}</b>\n\n"
+        "<code>/addbalance USER_ID AMOUNT</code>"
+    )
+
+    await answer_html(message, text)
+
+
+def _add_balance_tx(
+    conn: sqlite3.Connection,
+    user_id: int,
+    amount_kopecks: int,
+) -> bool:
+    conn.execute(
+        """
+        INSERT INTO users(user_id)
+        VALUES (?)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+
+    updated = conn.execute(
+        """
+        UPDATE users
+        SET balance_kopecks = balance_kopecks + ?
+        WHERE user_id = ?
+        """,
+        (amount_kopecks, user_id),
+    )
+
+    return updated.rowcount == 1
+
+
+@dp.message(Command("addbalance"))
+async def admin_add_balance(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    args = (message.text or "").split()
+
+    if len(args) != 3:
+        await message.answer(
+            "Формат: /addbalance USER_ID AMOUNT"
+        )
+        return
+
+    try:
+        target_user_id = int(args[1])
+        amount = parse_money(args[2])
+    except ValueError:
+        await message.answer("⚠️ Некорректные параметры.")
+        return
+
+    success = await db_transaction(
+        _add_balance_tx,
+        target_user_id,
+        amount,
+    )
+
+    if not success:
+        await message.answer("⚠️ Не удалось изменить баланс.")
+        return
+
+    await message.answer(
+        f"✅ Баланс пользователя {target_user_id} увеличен на "
+        f"{format_money(amount)} ₽."
     )
 
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💸 <b>НОВАЯ ЗАЯВКА НА ВЫВОД!</b>\nПользователь: <code>{user_id}</code>\nСумма: <b>{amount:,.2f} ₽</b>\nРеквизиты: <code>{requisites}</code>"
+        await send_html(
+            target_user_id,
+            f"💰 Администратор начислил вам "
+            f"<b>{format_money(amount)} ₽</b>.",
         )
     except Exception:
-        pass
+        logger.exception("Failed to notify user about manual balance credit")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ПОДДЕРЖКА И ВНЕШНИЕ СЕРВИСЫ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(F.text == "ℹ️ Помощь / Поддержка")
-async def show_help(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        f"🛡 <b>Гарант и Маркетплейс «BastionPRO»</b>\n"
-        f"────────────────────────────\n"
-        f"• Комиссия платформы: <b>40%</b> (с суммы закрытой сделки Продавца)\n"
-        f"• Выплаты баланса: <b>каждый вторник и четверг</b> (от 500 ₽)\n"
-        f"• Пополняйте баланс в разделе «👛 Кошелёк»\n\n"
-        f"👨‍💻 <b>Официальный контакт арбитража и поддержки:</b> {SUPPORT_HANDLE}",
-        reply_markup=get_main_keyboard()
-    )
 
-@router.message(F.text == "🌐 Подключить OnyxVPN")
-async def open_onyx_vpn(message: Message, state: FSMContext):
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Запустить OnyxVPN", url="https://t.me/vpnonyxxbot")]
-    ])
-    await message.answer(
-        "🌐 <b>OnyxVPN — быстрый и безопасный VPN</b>\n\n"
-        "• Надежное шифрование данных\n"
-        "• Отсутствие логов и ограничений скорости",
-        reply_markup=kb
-    )
+# =========================================================
+# GENERAL CALLBACKS
+# =========================================================
 
-# ══════════════════════════════════════════════════════════════════════════════
-# АДМИНИСТРАТИВНАЯ ПАНЕЛЬ И АРБИТРАЖ
-# ══════════════════════════════════════════════════════════════════════════════
-@router.message(Command("admin"))
-async def admin_panel(message: Message, state: FSMContext):
-    await state.clear()
-    if message.from_user.id != ADMIN_ID:
-        return
+@dp.callback_query(F.data == "close_menu")
+async def close_menu(callback: CallbackQuery) -> None:
+    await answer_callback(callback)
 
-    users_cnt = (await db_get_one("SELECT COUNT(*) as c FROM users"))["c"]
-    deals_cnt = (await db_get_one("SELECT COUNT(*) as c FROM deals WHERE status = 'completed'"))["c"]
-    vault_sum = (await db_get_one("SELECT SUM(fee_amount) as s FROM platform_vault"))["s"] or 0.0
-
-    text = (
-        f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
-        f"────────────────────────────\n"
-        f"👥 Пользователей: <b>{users_cnt}</b>\n"
-        f"✅ Закрытых сделок: <b>{deals_cnt}</b>\n"
-        f"💰 Доход платформы (40%): <b>{vault_sum:,.2f} ₽</b>\n"
-        f"────────────────────────────"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="admin_broadcast")]
-    ])
-    await message.answer(text, reply_markup=kb)
-
-@router.callback_query(F.data.startswith("admin_refund:"))
-async def cb_admin_refund(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    deal_id = int(call.data.split(":")[1])
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
-
-    if deal:
-        await db_transaction([
-            ("UPDATE users SET balance = balance + ? WHERE user_id = ?", (deal["amount"], deal["buyer_id"])),
-            ("UPDATE deals SET status = 'cancelled' WHERE id = ?", (deal_id,))
-        ])
-        await call.answer("Возврат покупателю выполнен.", show_alert=True)
+    if callback.message:
         try:
-            await bot.send_message(deal["buyer_id"], f"⚖️ По решению арбитража сумма {deal['amount']:,.2f} ₽ возвращена вам на баланс Кошелька.")
-            await bot.send_message(deal["seller_id"], f"⚖️ Арбитраж по сделке №{deal_id} закрыт в пользу Покупателя.")
+            await callback.message.delete()
         except Exception:
             pass
-        await render_deal_view(call.message, deal_id, call.from_user.id, is_edit=True)
 
-@router.callback_query(F.data.startswith("admin_payout:"))
-async def cb_admin_payout(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    deal_id = int(call.data.split(":")[1])
-    deal = await db_get_one("SELECT * FROM deals WHERE id = ?", (deal_id,))
 
-    if deal:
-        await db_transaction([
-            ("UPDATE users SET balance = balance + ? WHERE user_id = ?", (deal["seller_receives"], deal["seller_id"])),
-            ("INSERT INTO platform_vault (deal_id, fee_amount, created_at) VALUES (?, ?, ?)", (deal_id, deal["fee"], datetime.now().isoformat())),
-            ("UPDATE deals SET status = 'completed' WHERE id = ?", (deal_id,))
-        ])
-        await call.answer("Средства выплачены продавцу.", show_alert=True)
+# =========================================================
+# STARTUP
+# =========================================================
+
+def _close_database(conn: sqlite3.Connection) -> None:
+    global _persistent_conn
+
+    if _persistent_conn is not None:
+        _persistent_conn.close()
+        _persistent_conn = None
+
+
+async def main() -> None:
+    global BOT_USERNAME
+
+    await init_database()
+
+    me = await bot.get_me()
+    BOT_USERNAME = me.username or ""
+
+    logger.info(
+        "Bot started: @%s, admins=%s",
+        BOT_USERNAME,
+        sorted(ADMIN_IDS),
+    )
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
         try:
-            await bot.send_message(deal["seller_id"], f"⚖️ По решению арбитража сумма {deal['seller_receives']:,.2f} ₽ начислена на ваш баланс.")
-            await bot.send_message(deal["buyer_id"], f"⚖️ Арбитраж по сделке №{deal_id} закрыт в пользу Продавца.")
+            await bot.session.close()
         except Exception:
             pass
-        await render_deal_view(call.message, deal_id, call.from_user.id, is_edit=True)
 
-@router.callback_query(F.data == "admin_broadcast")
-async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(AdminBroadcast.text)
-    await call.message.answer("📢 Введите текст рассылки для всех пользователей:", reply_markup=get_cancel_reply_kb())
-    await call.answer()
-
-@router.message(AdminBroadcast.text)
-async def process_admin_broadcast(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Рассылка отменена.", reply_markup=get_main_keyboard())
-        return
-
-    users = await db_get_all("SELECT user_id FROM users")
-    await state.clear()
-    sent = 0
-    for u in users:
         try:
-            await bot.send_message(u["user_id"], message.text)
-            sent += 1
-            await asyncio.sleep(0.05)
+            await db_call(_close_database)
         except Exception:
-            pass
-    await message.answer(f"✅ Рассылка завершена! Отправлено: {sent} пользователям.", reply_markup=get_main_keyboard())
+            logger.exception("Failed to close database")
 
-@router.callback_query(F.data == "cancel_fsm")
-async def cb_cancel_fsm(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await safe_edit_text(call.message, "🚫 Действие отменено.")
-    await call.answer()
+        db_executor.shutdown(wait=True)
 
-@router.callback_query(F.data == "close_view")
-async def cb_close_view(call: CallbackQuery):
-    await call.message.delete()
-    await call.answer()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ТОЧКА ВХОДА
-# ══════════════════════════════════════════════════════════════════════════════
-async def main():
-    await init_db()
-    logger.info("Запуск маркетплейса BastionPRO...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped")
