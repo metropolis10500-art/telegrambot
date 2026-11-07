@@ -3355,10 +3355,11 @@ async def cb_super_ask(call: CallbackQuery, state: FSMContext, db: Database, bot
         stat_row("✍️", "Сообщение", "Напиши текст, который доставим адресату"),
         stat_row("🚀", "Доставка", "Мгновенно, без ожидания взаимного лайка"),
     ])
+    superlikes_count = me["superlikes"]
     await send_screen(
         bot,
         uid,
-        f"{screen_header('Супер-письмо', f'Доступно: {me["superlikes"]} шт.')}\n"
+        f"{screen_header('Супер-письмо', f'Доступно: {superlikes_count} шт.')}\n"
         f"{super_msg_box}\n\n"
         f"Отправь сообщение в чат:",
         reply_markup=kb,
