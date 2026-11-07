@@ -29,7 +29,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from dotenv import load_dotenv
 
@@ -47,6 +49,13 @@ COMMISSION_PERCENT = int(os.getenv("COMMISSION_PERCENT", "30").strip() or 30)
 
 YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "410010000000000").strip()
 YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
+
+# Telegram Stars (внутренняя оплата Telegram)
+STARS_TOKEN = os.getenv("STARS_TOKEN", "").strip().strip('"').strip("'")
+STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip() == "1"
+
+# Курс: 1 звезда ≈ 1.5 руб (примерно, можно настроить)
+STARS_TO_RUB = float(os.getenv("STARS_TO_RUB", "1.5").strip() or 1.5)
 
 # Ссылки партнёра и технической поддержки
 VELVET_VPN_URL = "https://t.me/velvet?start=3SLkWOoF"
@@ -162,42 +171,13 @@ def celebration_line(text: str) -> str:
 
 
 def progress_bar(current: int, maximum: int, length: int = 10) -> str:
-    """Визуальный прогресс-бар для лайков, VIP и т.д."""
+    """Визуальный прогресс-бар."""
     if maximum <= 0:
         filled = length
     else:
         filled = max(0, min(length, int(current / maximum * length)))
     empty = length - filled
     return "🟩" * filled + "⬜️" * empty
-
-
-def emoji_line(emoji: str, label: str, value: str) -> str:
-    return f"{emoji} <b>{label}:</b> {value}"
-
-
-async def send_sticker(bot: Bot, user_id: int, key: str) -> None:
-    """Отправить стикер по ключу, если задан file_id."""
-    sticker_id = STICKERS.get(key, "")
-    if not sticker_id:
-        return
-    try:
-        await bot.send_sticker(chat_id=user_id, sticker=sticker_id)
-    except Exception:
-        pass
-
-
-# Эмодзи-разделители для «оживления» текста
-DIVIDERS: List[str] = [
-    "✨━━━━━━━━━━━━━━━━━━━✨",
-    "💫━━━━━━━━━━━━━━━━━━━💫",
-    "🔥━━━━━━━━━━━━━━━━━━━🔥",
-    "💘━━━━━━━━━━━━━━━━━━━💘",
-    "⚡━━━━━━━━━━━━━━━━━━━⚡",
-]
-
-
-def random_divider() -> str:
-    return random.choice(DIVIDERS)
 
 
 def emoji_line(emoji: str, label: str, value: str) -> str:
@@ -205,44 +185,23 @@ def emoji_line(emoji: str, label: str, value: str) -> str:
 
 
 def screen_header(title: str, subtitle: Optional[str] = None) -> str:
-    """Верхняя часть любого экрана бота."""
+    """Компактный заголовок экрана."""
     lines = [f"💎 <b>{esc(title)}</b>"]
     if subtitle:
         lines.append(f"<i>{esc(subtitle)}</i>")
-    lines.append(random_divider())
     return "\n".join(lines)
 
 
-def screen_section(title: str, content: str) -> str:
-    """Секция внутри экрана с заголовком и содержимым."""
-    return f"\n📂 <b>{title}</b>\n{content}"
-
-
 def screen_box(title: str, lines: List[str]) -> str:
-    """Красивая рамка-блок с информацией."""
+    """Компактный блок информации."""
     inner = "\n".join(f"   {line}" for line in lines)
     return f"┌─ <b>{esc(title)}</b>\n{inner}\n└─"
 
 
-def screen_footer(text: str) -> str:
-    """Нижняя часть экрана с разделителем."""
-    return f"\n{random_divider()}\n<i>{esc(text)}</i>"
-
-
 def stat_row(emoji: str, label: str, value: str, highlight: bool = False) -> str:
-    """Строка статистики с возможностью выделения."""
-    marker = "🔸" if highlight else "  "
+    """Строка статистики."""
+    marker = "🔹" if highlight else "  "
     return f"{marker} {emoji} <b>{label}:</b> {value}"
-
-
-def progress_bar(current: int, maximum: int, length: int = 10) -> str:
-    """Визуальный прогресс-бар для лайков, VIP и т.д."""
-    if maximum <= 0:
-        filled = length
-    else:
-        filled = max(0, min(length, int(current / maximum * length)))
-    empty = length - filled
-    return "🟩" * filled + "⬜️" * empty
 
 
 def celebration_line(text: str) -> str:
@@ -627,6 +586,108 @@ def is_yoomoney_token_configured() -> bool:
     if any(p in low for p in placeholders) or len(YOOMONEY_TOKEN) < 20:
         return False
     return True
+
+
+def is_stars_configured() -> bool:
+    return bool(STARS_TOKEN and len(STARS_TOKEN) > 10 and STARS_ENABLED)
+
+
+def rub_to_stars(rub: int) -> int:
+    """Конвертирует рубли в звёзды Telegram."""
+    return max(1, int(rub / STARS_TO_RUB))
+
+
+async def create_stars_invoice(
+    order_id: str,
+    rub_amount: int,
+    title: str,
+    description: str,
+) -> tuple:
+    """
+    Создаёт счёт для оплаты через Telegram Stars.
+    Возвращает (invoice_payload, stars_amount).
+    """
+    stars_amount = rub_to_stars(rub_amount)
+    payload = f"stars_{order_id}"
+    prices = [LabeledPrice(label=title, amount=stars_amount)]
+    return payload, stars_amount, prices
+
+
+async def process_stars_payment(
+    bot: Bot,
+    db: Database,
+    user_id: int,
+    order_id: str,
+    prod_key: str,
+    charge_id: str,
+) -> str:
+    """Начисляет привилегии после успешной оплаты звёздами."""
+    order = db.get_order(order_id)
+    if not order:
+        return "❌ Заказ не найден."
+
+    if order["status"] == "paid":
+        return "✅ Заказ уже оплачен."
+
+    db.mark_order_paid(order_id, charge_id)
+
+    if prod_key == "vip_3":
+        db.add_vip(user_id, days=3, bonus_superlikes=2)
+        reward_text = "👑 VIP на 3 дня и +2 💌 Супер-письма начислены!"
+    elif prod_key == "vip_7":
+        db.add_vip(user_id, days=7, bonus_superlikes=3)
+        reward_text = "👑 VIP на 7 дней и +3 💌 Супер-письма начислены!"
+    elif prod_key == "vip_30":
+        db.add_vip(user_id, days=30, bonus_superlikes=10)
+        reward_text = "👑 VIP на 30 дней и +10 💌 Супер-писем начислены!"
+    elif prod_key == "vip_90":
+        db.add_vip(user_id, days=90, bonus_superlikes=25)
+        reward_text = "👑 VIP на 90 дней и +25 💌 Супер-писем начислены!"
+    elif prod_key == "likes_unlimited":
+        db.add_vip(user_id, days=7, bonus_superlikes=0)
+        reward_text = "❤️ Безлимитные лайки на 7 дней активированы!"
+    elif prod_key == "likes_pack_50":
+        db.add_superlikes(user_id, count=50)
+        reward_text = "❤️ +50 лайков добавлено на баланс!"
+    elif prod_key == "boost_24":
+        db.add_boost(user_id, hours=24)
+        reward_text = "🚀 Буст в ТОП на 24 часа активирован!"
+    elif prod_key == "boost_72":
+        db.add_boost(user_id, hours=72)
+        reward_text = "🚀 Буст в ТОП на 72 часа активирован!"
+    elif prod_key == "super_1":
+        db.add_superlikes(user_id, count=1)
+        reward_text = "💌 +1 Супер-письмо добавлено!"
+    elif prod_key == "super_5":
+        db.add_superlikes(user_id, count=5)
+        reward_text = "💌 +5 Супер-писем добавлено!"
+    elif prod_key == "super_15":
+        db.add_superlikes(user_id, count=15)
+        reward_text = "💌 +15 Супер-писем добавлено!"
+    elif prod_key == "reset_skips":
+        cnt = db.reset_user_skips(user_id)
+        reward_text = f"🔄 История пропусков очищена (восстановлено анкет: {cnt})!"
+    elif prod_key == "see_likes":
+        db.add_vip(user_id, days=3, bonus_superlikes=0)
+        reward_text = "👀 Доступ к входящим лайкам на 3 дня активирован!"
+    elif prod_key == "anonymous_view":
+        db.add_vip(user_id, days=7, bonus_superlikes=0)
+        reward_text = "👤 Анонимный просмотр на 7 дней активирован!"
+    else:
+        reward_text = "✅ Услуга успешно активирована!"
+
+    inviter_id = db.reward_inviter_on_purchase(user_id)
+    if inviter_id:
+        try:
+            await bot.send_message(
+                inviter_id,
+                "💎 Приглашённый тобой друг совершил покупку!\n"
+                "🎁 Тебе начислен партнёрский бонус: 👑 +24 часа VIP и +2 💌 Супер-письма!",
+            )
+        except Exception:
+            pass
+
+    return reward_text
 
 
 async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str, bool]:
@@ -1718,39 +1779,36 @@ def kb_main_menu(db: Database, user_id: int) -> InlineKeyboardMarkup:
     p = db.get_profile(user_id)
     is_adult = bool(p and int(p["age"]) >= 18)
     liked_me_count = len(db.get_who_liked_me(user_id)) if p else 0
-    liked_btn_text = f"👀 Кто меня лайкнул ({liked_me_count})" if liked_me_count > 0 else "👀 Кто меня лайкнул"
 
     rows: List[List[InlineKeyboardButton]] = [
-        # Поиск и просмотр
+        # Основные действия
         [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
-        [InlineKeyboardButton(text=liked_btn_text, callback_data="likes:list")],
-        # Общение
+        [InlineKeyboardButton(text=f"👀 Кто меня лайкнул ({liked_me_count})", callback_data="likes:list")],
+        # Общение и настройки
         [
-            InlineKeyboardButton(text="💌 Мои мэтчи и Чат", callback_data="matches:list"),
-            InlineKeyboardButton(text="⚙️ Настройки анкеты", callback_data="settings:open"),
+            InlineKeyboardButton(text="💌 Мэтчи и чат", callback_data="matches:list"),
+            InlineKeyboardButton(text="⚙️ Анкета", callback_data="settings:open"),
         ],
         # Бонусы и рефералы
         [
             InlineKeyboardButton(text="🎁 Бонус дня", callback_data="bonus:daily"),
-            InlineKeyboardButton(text="👥 Бесплатный VIP", callback_data="ref:menu"),
+            InlineKeyboardButton(text="👥 Рефералы", callback_data="ref:menu"),
         ],
     ]
     if p and int(p["verified"]) == 0:
-        rows.append([InlineKeyboardButton(text="✅ Подтвердить анкету (+1 💌 в подарок)", callback_data="verify:start")])
+        rows.append([InlineKeyboardButton(text="✅ Верификация (+1 💌)", callback_data="verify:start")])
 
     if is_adult and PAYMENTS_ENABLED:
-        rows.append([InlineKeyboardButton(text="👑 Магазин привилегий и VIP", callback_data="shop:menu")])
+        rows.append([InlineKeyboardButton(text="👑 Магазин VIP", callback_data="shop:menu")])
 
-    rows.append(
-        [
-            InlineKeyboardButton(text="⭐️ Отзывы", callback_data="reviews:menu"),
-            InlineKeyboardButton(text="🆘 Помощь / Ошибка", callback_data="support:menu"),
-        ]
-    )
-    rows.append([InlineKeyboardButton(text="💎 Velvet VPN › Доступно всё", url=VELVET_VPN_URL)])
+    rows.append([
+        InlineKeyboardButton(text="⭐️ Отзывы", callback_data="reviews:menu"),
+        InlineKeyboardButton(text="🆘 Поддержка", callback_data="support:menu"),
+    ])
+    rows.append([InlineKeyboardButton(text="💎 Velvet VPN", url=VELVET_VPN_URL)])
 
     if user_id == ADMIN_ID:
-        rows.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin:menu")])
+        rows.append([InlineKeyboardButton(text="🛠 Админ", callback_data="admin:menu")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1818,45 +1876,45 @@ def kb_shop_menu() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
     # Вип подписки
-    rows.append([InlineKeyboardButton(text="👑 VIP ПОДПИСКИ", callback_data="shop:cat:vip")])
+    rows.append([InlineKeyboardButton(text="👑 VIP ПОДПИСКИ", callback_data="shop:info:vip")])
     for key in ("vip_3", "vip_7", "vip_30", "vip_90"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
     # Лайки
-    rows.append([InlineKeyboardButton(text="❤️ ЛАЙКИ", callback_data="shop:cat:likes")])
+    rows.append([InlineKeyboardButton(text="❤️ ЛАЙКИ", callback_data="shop:info:likes")])
     for key in ("likes_unlimited", "likes_pack_50"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
     # Бусты
-    rows.append([InlineKeyboardButton(text="🚀 БУСТЫ И ПРОДВИЖЕНИЕ", callback_data="shop:cat:boost")])
+    rows.append([InlineKeyboardButton(text="🚀 БУСТЫ", callback_data="shop:info:boost")])
     for key in ("boost_24", "boost_72"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
     # Супер письма
-    rows.append([InlineKeyboardButton(text="💌 СУПЕР-ПИСЬМА", callback_data="shop:cat:msg")])
+    rows.append([InlineKeyboardButton(text="💌 СУПЕР-ПИСЬМА", callback_data="shop:info:msg")])
     for key in ("super_1", "super_5", "super_15"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
     # Дополнительно
-    rows.append([InlineKeyboardButton(text="🔧 ДОПОЛНИТЕЛЬНО", callback_data="shop:cat:extra")])
+    rows.append([InlineKeyboardButton(text="🔧 ДРУГОЕ", callback_data="shop:info:extra")])
     for key in ("reset_skips", "see_likes", "anonymous_view"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
-    rows.append([InlineKeyboardButton(text="🎁 Получить VIP бесплатно (за друзей)", callback_data="ref:menu")])
+    rows.append([InlineKeyboardButton(text="🎁 VIP бесплатно (за друзей)", callback_data="ref:menu")])
     rows.append(
         [
-            InlineKeyboardButton(text="🛠 Помощь по оплате", url=SUPPORT_URL),
-            InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home"),
+            InlineKeyboardButton(text="🛠 Поддержка", url=SUPPORT_URL),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home"),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1912,6 +1970,11 @@ def card_line(emoji: str, label: str, value: str) -> str:
 def card_section(title: str) -> str:
     """Заголовок раздела внутри карточки."""
     return f"\n📋 <b>{title}</b>\n"
+
+
+def screen_footer(text: str) -> str:
+    """Нижняя часть экрана с разделителем."""
+    return f"\n━━━━━━━━━━━━━━━━━━━━\n<i>{esc(text)}</i>"
 
 
 def format_profile_card(
@@ -1973,17 +2036,18 @@ router = Router()
 async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[str] = None) -> None:
     p = db.get_profile(user_id)
     if not p:
-        welcome_box = screen_box("🎯 Что здесь есть", [
-            stat_row("✨", "Подбор", "По полу, интересам и совместимости"),
-            stat_row("🎥", "Медиа", "Живые фото и видео-анкеты"),
-            stat_row("💬", "Чат", "Встроенная переписка и ледоколы"),
-            stat_row("✅", "Безопасность", "Верификация против фейков"),
-        ])
         text = (
-            f"{screen_header('Добро пожаловать в «Лавчик»', 'Сервис знакомств нового поколения')}\n"
-            f"🌟 Здесь ты найдёшь новых друзей, яркое общение или свою вторую половинку.\n\n"
-            f"{welcome_box}\n\n"
-            f"👇 <b>Нажми кнопку ниже, чтобы создать анкету за 30 секунд:</b>"
+            f"{screen_header('Лавчик 💘', 'Знакомства, которые работают')}\n\n"
+            f"<b>Что это за бот:</b>\n"
+            f"«Лавчик» — сервис знакомств нового поколения для поиска друзей, общения и серьезных отношений.\n\n"
+            f"<b>Зачем он нужен:</b>\n"
+            f"• 🎯 Умный подбор по полу, возрасту, городу и интересам\n"
+            f"• 💞 Взаимная симпатия — мэтч только если понравились друг другу\n"
+            f"• 💬 Встроенный чат и ледоколы для легкого старта общения\n"
+            f"• 👤 Верификация анкет против фейков и ботов\n"
+            f"• 👑 VIP-статус, бусты и супер-письма для комфортного поиска\n\n"
+            f"🌍 Доступно: Россия, Беларусь, Казахстан, Украина и другие страны\n\n"
+            f"👇 <b>Создай анкету за 30 секунд и начни знакомства:</b>"
         )
         await send_chat_action(bot, user_id, "typing")
         await send_sticker(bot, user_id, "welcome")
@@ -2005,46 +2069,32 @@ async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[s
     now = int(time.time())
     vip_active = int(p["vip_until"]) > now
     boost_active = int(p["boost_until"]) > now
-    active_status = "🟢 Активна в поиске" if int(p["active"]) == 1 else "⏸ Скрыта из поиска"
+    active_status = "🟢 В поиске" if int(p["active"]) == 1 else "⏸ Скрыта"
 
-    vip_line = (
-        f"👑 <b>VIP-статус:</b> Активен (ещё {max(1, (int(p['vip_until']) - now) // 3600)} ч.)\n"
-        if vip_active
-        else "👑 <b>VIP-статус:</b> Не подключён\n"
+    vip_status = (
+        f"👑 VIP до {(int(p['vip_until']) - now) // 86400} дн."
+        if vip_active else "👑 VIP не подключён"
     )
-    boost_line = "🚀 <b>ТОП-продвижение:</b> Активно\n" if boost_active else ""
+    boost_status = "🚀 ТОП активно" if boost_active else ""
 
-    # Счётчик бесплатных лайков с прогресс-баром
+    # Счётчик бесплатных лайков
     if vip_active:
-        likes_block = screen_box("💝 Лайки", [stat_row("♾️", "Лимит", "Безлимит (VIP)", highlight=True)])
+        likes_line = "♾️ Безлимит (VIP)"
     else:
         used = db.count_today_likes(user_id)
         remaining = max(0, FREE_DAILY_LIKES - used)
-        bar = progress_bar(used, FREE_DAILY_LIKES, length=10)
-        likes_block = screen_box("💝 Лайки сегодня", [
-            stat_row("❤️", "Осталось", f"{remaining}/{FREE_DAILY_LIKES}", highlight=True),
-            stat_row("📊", "Прогресс", bar),
-        ])
-
-    status_block = screen_box("📡 Статус анкеты", [
-        stat_row("🟢" if int(p["active"]) == 1 else "⏸", "Показ", "Активна в поиске" if int(p["active"]) == 1 else "Скрыта из поиска"),
-        stat_row("👑", "VIP", vip_line.strip().replace("👑 <b>VIP-статус:</b> ", "") if vip_active else "Не подключён"),
-        stat_row("🚀", "ТОП", "Активно" if boost_active else "Не активно"),
-    ])
-
-    stats_block = screen_box("📊 Моя статистика", [
-        stat_row("💌", "Супер-писем", f"{p['superlikes']} шт.", highlight=True),
-        stat_row("👥", "Приглашено друзей", f"{p['ref_count']} чел."),
-        stat_row("✅", "Верификация", "Пройдена ✅" if int(p["verified"]) == 1 else "Не пройдена"),
-    ])
+        likes_line = f"{remaining}/{FREE_DAILY_LIKES} сегодня"
 
     text = (
         f"{format_profile_card(p, title='Моя анкета', show_prefs=True)}\n"
-        f"{status_block}\n"
-        f"{likes_block}\n"
-        f"{stats_block}\n"
-        f"{screen_footer('Нажми «🔥 Смотреть анкеты», чтобы начать знакомства!')}"
+        f"\n{stat_row('📡', 'Статус', active_status)}\n"
+        f"{stat_row('👑', 'VIP', vip_status)}\n"
+        f"{stat_row('❤️', 'Лайки', likes_line)}\n"
+        f"{stat_row('💌', 'Супер-писем', str(p['superlikes']))}\n"
+        f"{stat_row('👥', 'Рефералов', str(p['ref_count']))}\n"
     )
+    if boost_status:
+        text += f"{stat_row('🚀', 'Буст', boost_status)}\n"
     await send_chat_action(bot, user_id, "typing")
     await send_sticker(bot, user_id, "welcome")
     await send_screen(
@@ -4061,6 +4111,19 @@ async def complete_and_reward_order(bot: Bot, db: Database, order: sqlite3.Row, 
     return reward_text
 
 
+@router.callback_query(F.data.startswith("shop:info:"))
+async def cb_shop_info(call: CallbackQuery, bot: Bot) -> None:
+    category = call.data.split(":", 2)[2]
+    texts = {
+        "vip": "👑 <b>VIP-подписки</b>\n\nОткройте привилегии: просмотр лайков, безлимитные лайки, супер-письма, приоритет в поиске.",
+        "likes": "❤️ <b>Лайки</b>\n\nДополнительные лайки сверх дневного лимита или безлимит на неделю.",
+        "boost": "🚀 <b>Бусты</b>\n\nПоднимите анкету в ТОП, чтобы вас видели больше людей.",
+        "msg": "💌 <b>Супер-письма</b>\n\nНапишите любому человеку сразу, без ожидания взаимной симпатии.",
+        "extra": "🔧 <b>Другое</b>\n\nСброс пропусков, просмотр лайков, анонимный просмотр анкет.",
+    }
+    await call.answer(texts.get(category, "Раздел магазина"), show_alert=True)
+
+
 @router.callback_query(F.data == "shop:menu")
 async def cb_shop_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
     uid = call.from_user.id
@@ -4123,8 +4186,8 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
         stat_row("💵", "Сумма", f"{total_rub} ₽", highlight=True),
     ])
     instruction_box = screen_box("📋 Инструкция", [
-        stat_row("1️⃣", "Оплата", "Нажми «💳 Оплатить через ЮMoney» и заверши перевод"),
-        stat_row("2️⃣", "Проверка", "Нажми «🔄 Проверить оплату» — привилегии выдадутся автоматически"),
+        stat_row("1️⃣", "Оплата", "Выбери способ ниже и заверши перевод"),
+        stat_row("2️⃣", "Проверка", "После оплаты нажми «🔄 Проверить оплату»"),
     ])
     text = (
         f"{screen_header('Оформление заказа', prod.title)}\n"
@@ -4133,18 +4196,70 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
         f"{instruction_box}"
     )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Оплатить {total_rub} ₽ через ЮMoney", url=pay_url)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"shop:check:{order_id}")],
-            [InlineKeyboardButton(text="🛠 Помощь / Написать в поддержку", url=SUPPORT_URL)],
-            [
-                InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop:menu"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
-            ],
-        ]
-    )
+    kb_rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=f"💳 Оплатить {total_rub} ₽ через ЮMoney", url=pay_url)],
+    ]
+
+    # Оплата звёздами (Telegram Stars)
+    if is_stars_configured():
+        stars_amount = rub_to_stars(total_rub)
+        kb_rows.append([
+            InlineKeyboardButton(text=f"⭐️ Оплатить {stars_amount} ⭐️ (Звёзды)", callback_data=f"shop:pay:stars:{order_id}")
+        ])
+
+    kb_rows.extend([
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"shop:check:{order_id}")],
+        [InlineKeyboardButton(text="🛠 Помощь / Написать в поддержку", url=SUPPORT_URL)],
+        [
+            InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop:menu"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
+        ],
+    ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await send_screen(bot, uid, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("shop:pay:stars:"))
+async def cb_shop_pay_stars(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    """Оплата заказа через Telegram Stars."""
+    uid = call.from_user.id
+    if not is_stars_configured():
+        await call.answer("Оплата звёздами пока недоступна.", show_alert=True)
+        return
+
+    order_id = call.data.split(":", 3)[3]
+    order = db.get_order(order_id)
+    if not order or int(order["user_id"]) != uid:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order["status"] == "paid":
+        await call.answer("Заказ уже оплачен!", show_alert=True)
+        return
+
+    prod_key = str(order["product"])
+    prod = PRODUCTS.get(prod_key)
+    if not prod:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+
+    total_rub = int(order["amount"])
+    payload, stars_amount, prices = await create_stars_invoice(order_id, total_rub, prod.title, prod.description)
+
+    try:
+        await bot.send_invoice(
+            chat_id=uid,
+            title=prod.title,
+            description=prod.description[:256],
+            payload=payload,
+            currency="XTR",
+            prices=prices,
+        )
+        await call.answer("Счёт выставлен! Оплатой через звёзды.")
+    except Exception as e:
+        logging.error(f"Stars invoice error: {e}")
+        await call.answer("Ошибка выставления счёта.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("shop:check:"))
@@ -4288,6 +4403,58 @@ async def cb_admin_payment_decision(call: CallbackQuery, db: Database, bot: Bot)
             )
         except Exception:
             pass
+
+
+# =========================
+# ТЕLEGRAM STARS (ОПЛАТА ЗВЁЗДАМИ)
+# =========================
+@router.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: Bot, db: Database) -> None:
+    """Подтверждение готовности принять оплату звёздами."""
+    payload = pre_checkout_query.invoice_payload
+    if not payload or not payload.startswith("stars_"):
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Неверный заказ.")
+        return
+
+    order_id = payload.replace("stars_", "", 1)
+    order = db.get_order(order_id)
+    if not order or order["status"] == "paid":
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Заказ не найден или уже оплачен.")
+        return
+
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message, db: Database, bot: Bot) -> None:
+    """Начисление привилегий после успешной оплаты звёздами."""
+    payment = message.successful_payment
+    payload = payment.invoice_payload
+
+    if not payload or not payload.startswith("stars_"):
+        return
+
+    order_id = payload.replace("stars_", "", 1)
+    order = db.get_order(order_id)
+    if not order or order["status"] == "paid":
+        return
+
+    uid = int(order["user_id"])
+    prod_key = str(order["product"])
+
+    reward_text = await process_stars_payment(bot, db, uid, order_id, prod_key, payment.telegram_payment_charge_id)
+
+    await message.answer(
+        f"🎉 <b>Оплата звёздами прошла успешно!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{reward_text}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]
+        ),
+    )
 
 
 # =========================
