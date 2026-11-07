@@ -3,11 +3,12 @@ import html
 import logging
 import math
 import os
+import random
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -59,7 +60,7 @@ BOT_USERNAME: str = ""
 
 
 # =========================
-# УТИЛИТЫ БЕЗОПАСНОСТИ И ГОРОДОВ
+# СПРАВОЧНИКИ: ИНТЕРЕСЫ, ГОРОДА, ЛЕДОКОЛЫ
 # =========================
 def esc(value: Any) -> str:
     """Безопасное экранирование любого пользовательского текста для HTML."""
@@ -67,6 +68,29 @@ def esc(value: Any) -> str:
         return ""
     return html.escape(str(value))
 
+
+INTERESTS_MAP: Dict[str, str] = {
+    "love": "❤️ Отношения",
+    "friends": "🥂 Дружба и тусовки",
+    "walks": "🌆 Вечерние прогулки",
+    "movies": "🎬 Кино и сериалы",
+    "music": "🎵 Музыка",
+    "sport": "🏋️ Спорт и фитнес",
+    "games": "🎮 Видеоигры",
+    "travel": "✈️ Путешествия",
+    "coffee": "☕️ Кофе и рестораны",
+    "art": "🎨 Творчество",
+}
+
+ICEBREAKERS: List[str] = [
+    "🎲 Привет! Какой твой идеальный сценарий на вечер пятницы: шумная тусовка, прогулка по ночному городу или сериал с пиццей?",
+    "🎲 Привет! Если бы мы прямо сейчас могли телепортироваться в любую точку мира на выходные, куда бы полетели?",
+    "🎲 Привет! Какая песня сейчас стоит у тебя на повторе в плейлисте?",
+    "🎲 Привет! Кофе или чай? И какое твоё самое любимое место в нашем городе?",
+    "🎲 Привет! Расскажи 2 правдивых факта о себе и 1 выдуманный — а я попробую угадать, где ложь 😊",
+    "🎲 Привет! Какой фильм или сериал ты можешь пересматривать бесконечно?",
+    "🎲 Привет! Что тебя больше всего цепляет в людях при первом знакомстве?",
+]
 
 CITY_ALIASES: Dict[str, str] = {
     "мск": "Москва",
@@ -128,6 +152,53 @@ def format_looking_for_label(looking_for: str) -> str:
     return "👥 Всех"
 
 
+def parse_interests(raw: str) -> Set[str]:
+    if not raw:
+        return set()
+    return {k.strip() for k in raw.split(",") if k.strip() in INTERESTS_MAP}
+
+
+def format_interests_list(raw: str) -> str:
+    keys = parse_interests(raw)
+    if not keys:
+        return "Не указаны"
+    return ", ".join(INTERESTS_MAP[k] for k in keys)
+
+
+def calc_compatibility(viewer: Optional[sqlite3.Row], target: sqlite3.Row) -> Tuple[int, List[str]]:
+    """Считает процент совместимости и список общих интересов."""
+    if not viewer:
+        return 0, []
+    v_int = parse_interests(str(viewer["interests"] or ""))
+    t_int = parse_interests(str(target["interests"] or ""))
+    common = [INTERESTS_MAP[k] for k in (v_int & t_int)]
+
+    score = 55
+    if str(viewer["city"]).lower() == str(target["city"]).lower():
+        score += 15
+    age_diff = abs(int(viewer["age"]) - int(target["age"]))
+    if age_diff <= 2:
+        score += 12
+    elif age_diff <= 5:
+        score += 7
+
+    score += min(17, len(common) * 6)
+    return min(99, score), common
+
+
+def format_online_status(last_active: int) -> str:
+    if last_active <= 0:
+        return "🕒 Недавно"
+    diff = int(time.time()) - last_active
+    if diff < 900:
+        return "🟢 Онлайн"
+    if diff < 3600:
+        return f"🟢 Был(а) {max(1, diff // 60)} мин. назад"
+    if diff < 86400:
+        return f"🕒 Был(а) {diff // 3600} ч. назад"
+    return "🕒 Был(а) недавно"
+
+
 # =========================
 # ТАРИФЫ И УСЛУГИ МАГАЗИНА
 # =========================
@@ -174,14 +245,12 @@ PRODUCTS: Dict[str, Product] = {
 
 
 def calc_price_with_commission(base_price: int) -> Tuple[int, int, int]:
-    """Возвращает (базовая_цена, комиссия_процентов, итого_к_оплате)."""
     commission = math.ceil(base_price * (COMMISSION_PERCENT / 100.0))
     total = base_price + commission
     return base_price, commission, total
 
 
 def create_yoomoney_pay_link(order_id: str, total_rub: int, description: str) -> str:
-    """Генерирует платёжную ссылку ЮMoney (оплата картой любого банка или кошельком)."""
     params = {
         "receiver": YOOMONEY_WALLET,
         "quickpay-form": "button",
@@ -194,7 +263,6 @@ def create_yoomoney_pay_link(order_id: str, total_rub: int, description: str) ->
 
 
 def is_yoomoney_token_configured() -> bool:
-    """Проверяет, задан ли реальный токен ЮMoney в .env."""
     if not YOOMONEY_TOKEN:
         return False
     placeholders = ("ваш_токен", "your_token", "insert", "placeholder", "токен_юmoney", "xxx")
@@ -205,10 +273,6 @@ def is_yoomoney_token_configured() -> bool:
 
 
 async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str, bool]:
-    """
-    Проверяет поступление средств через API ЮMoney по метке order_id.
-    Возвращает: (оплачено: bool, текст_сообщения: str, нужна_ручная_проверка_админом: bool)
-    """
     if not is_yoomoney_token_configured():
         return (
             False,
@@ -283,15 +347,23 @@ class Database:
                     gender TEXT NOT NULL DEFAULT 'M',
                     looking_for TEXT NOT NULL DEFAULT 'A',
                     age INTEGER NOT NULL,
+                    min_pref_age INTEGER NOT NULL DEFAULT 18,
+                    max_pref_age INTEGER NOT NULL DEFAULT 45,
                     city TEXT NOT NULL,
                     bio TEXT NOT NULL,
+                    interests TEXT NOT NULL DEFAULT '',
                     photo_id TEXT,
+                    media_type TEXT NOT NULL DEFAULT 'photo',
+                    verified INTEGER NOT NULL DEFAULT 0,
+                    banned INTEGER NOT NULL DEFAULT 0,
                     active INTEGER NOT NULL DEFAULT 1,
                     boost_until INTEGER NOT NULL DEFAULT 0,
                     vip_until INTEGER NOT NULL DEFAULT 0,
                     superlikes INTEGER NOT NULL DEFAULT 1,
                     referred_by INTEGER NOT NULL DEFAULT 0,
                     ref_count INTEGER NOT NULL DEFAULT 0,
+                    last_active INTEGER NOT NULL DEFAULT 0,
+                    last_daily_bonus INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 )
                 """
@@ -391,18 +463,25 @@ class Database:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         p_cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
-        if "gender" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN gender TEXT NOT NULL DEFAULT 'M'")
-        if "looking_for" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN looking_for TEXT NOT NULL DEFAULT 'A'")
-        if "vip_until" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN vip_until INTEGER NOT NULL DEFAULT 0")
-        if "superlikes" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN superlikes INTEGER NOT NULL DEFAULT 1")
-        if "referred_by" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN referred_by INTEGER NOT NULL DEFAULT 0")
-        if "ref_count" not in p_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0")
+        migrations = [
+            ("gender", "ALTER TABLE profiles ADD COLUMN gender TEXT NOT NULL DEFAULT 'M'"),
+            ("looking_for", "ALTER TABLE profiles ADD COLUMN looking_for TEXT NOT NULL DEFAULT 'A'"),
+            ("min_pref_age", "ALTER TABLE profiles ADD COLUMN min_pref_age INTEGER NOT NULL DEFAULT 18"),
+            ("max_pref_age", "ALTER TABLE profiles ADD COLUMN max_pref_age INTEGER NOT NULL DEFAULT 45"),
+            ("interests", "ALTER TABLE profiles ADD COLUMN interests TEXT NOT NULL DEFAULT ''"),
+            ("media_type", "ALTER TABLE profiles ADD COLUMN media_type TEXT NOT NULL DEFAULT 'photo'"),
+            ("verified", "ALTER TABLE profiles ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"),
+            ("banned", "ALTER TABLE profiles ADD COLUMN banned INTEGER NOT NULL DEFAULT 0"),
+            ("vip_until", "ALTER TABLE profiles ADD COLUMN vip_until INTEGER NOT NULL DEFAULT 0"),
+            ("superlikes", "ALTER TABLE profiles ADD COLUMN superlikes INTEGER NOT NULL DEFAULT 1"),
+            ("referred_by", "ALTER TABLE profiles ADD COLUMN referred_by INTEGER NOT NULL DEFAULT 0"),
+            ("ref_count", "ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0"),
+            ("last_active", "ALTER TABLE profiles ADD COLUMN last_active INTEGER NOT NULL DEFAULT 0"),
+            ("last_daily_bonus", "ALTER TABLE profiles ADD COLUMN last_daily_bonus INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for col_name, sql in migrations:
+            if col_name not in p_cols:
+                conn.execute(sql)
 
         o_cols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
         if "base_amount" not in o_cols:
@@ -412,7 +491,7 @@ class Database:
         conn.commit()
 
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_search ON profiles(active, age, gender, city);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_profiles_search ON profiles(active, banned, age, gender, city);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reactions_user ON reactions(user_id, action);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_id, action);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_blocks_user ON blocks(user_id, blocked_id);")
@@ -422,10 +501,59 @@ class Database:
         with self._connect() as conn:
             return conn.execute("SELECT * FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
 
-    def sync_username(self, user_id: int, username: Optional[str]) -> None:
+    def touch_user(self, user_id: int, username: Optional[str] = None) -> None:
+        now = int(time.time())
         with self._connect() as conn:
-            conn.execute("UPDATE profiles SET username = ? WHERE user_id = ?", (username, user_id))
+            if username is not None:
+                conn.execute("UPDATE profiles SET last_active = ?, username = ? WHERE user_id = ?", (now, username, user_id))
+            else:
+                conn.execute("UPDATE profiles SET last_active = ? WHERE user_id = ?", (now, user_id))
             conn.commit()
+
+    def set_banned(self, user_id: int, banned: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE profiles SET banned = ?, active = ? WHERE user_id = ?",
+                (1 if banned else 0, 0 if banned else 1, user_id),
+            )
+            conn.commit()
+
+    def set_verified(self, user_id: int, verified: bool = True) -> bool:
+        p = self.get_profile(user_id)
+        if not p:
+            return False
+        was_verified = int(p["verified"]) == 1
+        with self._connect() as conn:
+            if not was_verified and verified:
+                conn.execute(
+                    "UPDATE profiles SET verified = 1, superlikes = superlikes + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                conn.execute("UPDATE profiles SET verified = ? WHERE user_id = ?", (1 if verified else 0, user_id))
+            conn.commit()
+        return not was_verified and verified
+
+    def claim_daily_bonus(self, user_id: int) -> Tuple[bool, int]:
+        """Возвращает (успешно_ли, сколько_часов_осталось_ждать)."""
+        p = self.get_profile(user_id)
+        if not p:
+            return False, 0
+        now = int(time.time())
+        last = int(p["last_daily_bonus"])
+        if now - last < 86400:
+            hours_left = max(1, (86400 - (now - last)) // 3600)
+            return False, hours_left
+
+        cur_boost = max(int(p["boost_until"]), now)
+        new_boost = cur_boost + 2 * 3600
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE profiles SET last_daily_bonus = ?, boost_until = ? WHERE user_id = ?",
+                (now, new_boost, user_id),
+            )
+            conn.commit()
+        return True, 0
 
     def set_pending_referral(self, user_id: int, inviter_id: int) -> None:
         if user_id == inviter_id or inviter_id <= 0:
@@ -518,20 +646,45 @@ class Database:
         age: int,
         city: str,
         bio: str,
+        interests: str,
         photo_id: Optional[str],
+        media_type: str = "photo",
     ) -> bool:
         now = int(time.time())
         norm_city = normalize_city(city)
+        if age < 18:
+            min_a, max_a = 14, 17
+        else:
+            min_a = max(18, age - 5)
+            max_a = min(80, age + 8)
+
         existing = self.get_profile(user_id)
         with self._connect() as conn:
             if existing:
                 conn.execute(
                     """
                     UPDATE profiles
-                    SET username = ?, name = ?, gender = ?, looking_for = ?, age = ?, city = ?, bio = ?, photo_id = ?, active = 1
+                    SET username = ?, name = ?, gender = ?, looking_for = ?, age = ?,
+                        min_pref_age = ?, max_pref_age = ?, city = ?, bio = ?, interests = ?,
+                        photo_id = ?, media_type = ?, active = 1, last_active = ?
                     WHERE user_id = ?
                     """,
-                    (username, name, gender, looking_for, age, norm_city, bio, photo_id, user_id),
+                    (
+                        username,
+                        name,
+                        gender,
+                        looking_for,
+                        age,
+                        min_a,
+                        max_a,
+                        norm_city,
+                        bio,
+                        interests,
+                        photo_id,
+                        media_type,
+                        now,
+                        user_id,
+                    ),
                 )
                 conn.commit()
                 return False
@@ -539,19 +692,39 @@ class Database:
                 conn.execute(
                     """
                     INSERT INTO profiles (
-                        user_id, username, name, gender, looking_for, age, city, bio, photo_id,
-                        active, boost_until, vip_until, superlikes, referred_by, ref_count, created_at
+                        user_id, username, name, gender, looking_for, age, min_pref_age, max_pref_age,
+                        city, bio, interests, photo_id, media_type, verified, banned,
+                        active, boost_until, vip_until, superlikes, referred_by, ref_count, last_active, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 1, 0, 0, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, 0, 0, 1, 0, 0, ?, ?)
                     """,
-                    (user_id, username, name, gender, looking_for, age, norm_city, bio, photo_id, now),
+                    (
+                        user_id,
+                        username,
+                        name,
+                        gender,
+                        looking_for,
+                        age,
+                        min_a,
+                        max_a,
+                        norm_city,
+                        bio,
+                        interests,
+                        photo_id,
+                        media_type,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
                 return True
 
-    def update_photo(self, user_id: int, photo_id: Optional[str]) -> None:
+    def update_media(self, user_id: int, photo_id: Optional[str], media_type: str = "photo") -> None:
         with self._connect() as conn:
-            conn.execute("UPDATE profiles SET photo_id = ? WHERE user_id = ?", (photo_id, user_id))
+            conn.execute(
+                "UPDATE profiles SET photo_id = ?, media_type = ? WHERE user_id = ?",
+                (photo_id, media_type, user_id),
+            )
             conn.commit()
 
     def update_bio(self, user_id: int, bio: str) -> None:
@@ -571,6 +744,19 @@ class Database:
                 "UPDATE profiles SET gender = ?, looking_for = ? WHERE user_id = ?",
                 (gender, looking_for, user_id),
             )
+            conn.commit()
+
+    def update_age_range(self, user_id: int, min_age: int, max_age: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE profiles SET min_pref_age = ?, max_pref_age = ? WHERE user_id = ?",
+                (min_age, max_age, user_id),
+            )
+            conn.commit()
+
+    def update_interests(self, user_id: int, interests: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE profiles SET interests = ? WHERE user_id = ?", (interests, user_id))
             conn.commit()
 
     def set_active(self, user_id: int, active: bool) -> None:
@@ -659,15 +845,6 @@ class Database:
             )
             conn.commit()
 
-    def is_matched(self, a: int, b: int) -> bool:
-        u1, u2 = (a, b) if a < b else (b, a)
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM matches WHERE user1 = ? AND user2 = ?",
-                (u1, u2),
-            ).fetchone()
-            return row is not None
-
     def list_matches(self, user_id: int, limit: int = 20) -> List[sqlite3.Row]:
         me = self.get_profile(user_id)
         if not me:
@@ -695,7 +872,7 @@ class Database:
                 if self.is_blocked_between(user_id, other_id):
                     continue
                 p = self.get_profile(other_id)
-                if p and int(p["active"]) == 1 and min_age <= int(p["age"]) <= max_age:
+                if p and int(p["active"]) == 1 and int(p["banned"]) == 0 and min_age <= int(p["age"]) <= max_age:
                     result.append(p)
             return result
 
@@ -712,7 +889,7 @@ class Database:
                 SELECT p.* FROM profiles p
                 JOIN reactions r ON p.user_id = r.user_id
                 WHERE r.target_id = ? AND r.action = 'like'
-                  AND p.active = 1
+                  AND p.active = 1 AND p.banned = 0
                   AND p.age BETWEEN ? AND ?
                   AND p.user_id NOT IN (SELECT target_id FROM reactions WHERE user_id = ?)
                   AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)
@@ -764,7 +941,11 @@ class Database:
         my_age = int(me["age"])
         my_gender = str(me["gender"] or "M")
         my_looking = str(me["looking_for"] or "A")
-        min_age, max_age = (14, 17) if my_age < 18 else (18, 100)
+
+        # Строгая граница 18+ / <18
+        hard_min, hard_max = (14, 17) if my_age < 18 else (18, 100)
+        pref_min = max(hard_min, int(me["min_pref_age"] or hard_min))
+        pref_max = min(hard_max, int(me["max_pref_age"] or hard_max))
 
         with self._connect() as conn:
             base_query = """
@@ -772,6 +953,7 @@ class Database:
                 FROM profiles p
                 WHERE p.user_id != ?
                   AND p.active = 1
+                  AND p.banned = 0
                   AND p.age BETWEEN ? AND ?
                   AND (? = 'A' OR p.gender = ?)
                   AND (p.looking_for = 'A' OR p.looking_for = ?)
@@ -779,45 +961,73 @@ class Database:
                   AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)
                   AND p.user_id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?)
             """
-            params: List[object] = [
+            order_clause = """
+                ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
+                         (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
+                         p.verified DESC,
+                         (CASE WHEN p.last_active > ? THEN 1 ELSE 0 END) DESC,
+                         RANDOM()
+                LIMIT 1
+            """
+            recent_cutoff = now - 3600 * 12
+
+            # 1. Ищем в том же городе по предпочтительному возрасту
+            if city_prioritized:
+                params_pref_city = [
+                    user_id,
+                    pref_min,
+                    pref_max,
+                    my_looking,
+                    my_looking,
+                    my_gender,
+                    user_id,
+                    user_id,
+                    user_id,
+                    my_city,
+                    now,
+                    now,
+                    recent_cutoff,
+                ]
+                q1 = base_query + " AND LOWER(TRIM(p.city)) = ? " + order_clause
+                row = conn.execute(q1, params_pref_city).fetchone()
+                if row:
+                    return row
+
+            # 2. Ищем в любом городе по предпочтительному возрасту
+            params_pref_any = [
                 user_id,
-                min_age,
-                max_age,
+                pref_min,
+                pref_max,
                 my_looking,
                 my_looking,
                 my_gender,
                 user_id,
                 user_id,
                 user_id,
+                now,
+                now,
+                recent_cutoff,
             ]
+            row = conn.execute(base_query + order_clause, params_pref_any).fetchone()
+            if row:
+                return row
 
-            if city_prioritized:
-                q1 = (
-                    base_query
-                    + """
-                    AND LOWER(TRIM(p.city)) = ?
-                    ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
-                             (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
-                             p.boost_until DESC,
-                             RANDOM()
-                    LIMIT 1
-                    """
-                )
-                row = conn.execute(q1, (*params, my_city, now, now)).fetchone()
-                if row:
-                    return row
-
-            q2 = (
-                base_query
-                + """
-                ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
-                         (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
-                         p.boost_until DESC,
-                         RANDOM()
-                LIMIT 1
-                """
-            )
-            return conn.execute(q2, (*params, now, now)).fetchone()
+            # 3. Если по узкому фильтру возраста никого не осталось — ищем по всей допустимой категории (18+ или <18)
+            params_fallback = [
+                user_id,
+                hard_min,
+                hard_max,
+                my_looking,
+                my_looking,
+                my_gender,
+                user_id,
+                user_id,
+                user_id,
+                now,
+                now,
+                recent_cutoff,
+            ]
+            return conn.execute(base_query + order_clause, params_fallback).fetchone()
 
     def create_order(
         self, order_id: str, user_id: int, product: str, base_amount: int, commission: int, total_amount: int
@@ -846,9 +1056,7 @@ class Database:
             )
             conn.commit()
 
-    # --- МЕТОДЫ ОТЗЫВОВ ---
     def add_or_update_review(self, user_id: int, author_name: str, rating: int, text: str) -> Tuple[int, bool]:
-        """Сохраняет или обновляет отзыв пользователя. Возвращает (review_id, это_первый_отзыв)."""
         now = int(time.time())
         with self._connect() as conn:
             existing = conn.execute("SELECT id FROM reviews WHERE user_id = ?", (user_id,)).fetchone()
@@ -890,6 +1098,7 @@ class Database:
         now = int(time.time())
         with self._connect() as conn:
             total_users = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+            verified_users = conn.execute("SELECT COUNT(*) FROM profiles WHERE verified = 1").fetchone()[0]
             vip_users = conn.execute("SELECT COUNT(*) FROM profiles WHERE vip_until > ?", (now,)).fetchone()[0]
             total_refs = conn.execute("SELECT COUNT(*) FROM profiles WHERE referred_by > 0").fetchone()[0]
             paid_orders = conn.execute("SELECT COUNT(*) FROM orders WHERE status = 'paid'").fetchone()[0]
@@ -903,6 +1112,7 @@ class Database:
             total_matches = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
             return {
                 "users": total_users,
+                "verified": verified_users,
                 "vips": vip_users,
                 "refs": total_refs,
                 "orders": paid_orders,
@@ -914,7 +1124,7 @@ class Database:
 
     def get_all_user_ids(self) -> List[int]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT user_id FROM profiles").fetchall()
+            rows = conn.execute("SELECT user_id FROM profiles WHERE banned = 0").fetchall()
             return [int(r["user_id"]) for r in rows]
 
 
@@ -927,6 +1137,7 @@ class ProfileForm(StatesGroup):
     looking_for = State()
     age = State()
     city = State()
+    interests = State()
     bio = State()
     photo = State()
 
@@ -937,6 +1148,12 @@ class EditProfileForm(StatesGroup):
     waiting_city = State()
     waiting_gender = State()
     waiting_looking_for = State()
+    waiting_interests = State()
+    waiting_age_range = State()
+
+
+class VerifyForm(StatesGroup):
+    waiting_video_note = State()
 
 
 class SuperMsgForm(StatesGroup):
@@ -962,7 +1179,7 @@ class AdminForm(StatesGroup):
 
 
 # =========================
-# АВТО-ОЧИСТКА СООБЩЕНИЙ
+# АВТО-ОЧИСТКА И ОТПРАВКА ЭКРАНОВ (ФОТО И ВИДЕО)
 # =========================
 async def clear_previous_bot_messages(bot: Bot, user_id: int) -> None:
     msg_ids = last_bot_messages.get(user_id, [])
@@ -987,28 +1204,42 @@ async def send_screen(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     photo_id: Optional[str] = None,
+    media_type: str = "photo",
 ) -> Message:
     await clear_previous_bot_messages(bot, user_id)
     if photo_id:
-        msg = await bot.send_photo(
-            chat_id=user_id,
-            photo=photo_id,
-            caption=text,
-            reply_markup=reply_markup,
-        )
-    else:
-        msg = await bot.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+        try:
+            if media_type == "video":
+                msg = await bot.send_video(
+                    chat_id=user_id,
+                    video=photo_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+            else:
+                msg = await bot.send_photo(
+                    chat_id=user_id,
+                    photo=photo_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+            last_bot_messages[user_id] = [msg.message_id]
+            return msg
+        except Exception:
+            pass
+
+    msg = await bot.send_message(
+        chat_id=user_id,
+        text=text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
     last_bot_messages[user_id] = [msg.message_id]
     return msg
 
 
 # =========================
-# КЛАВИАТУРЫ И ДИЗАЙН
+# КЛАВИАТУРЫ И КАРТОЧКА ПРОФИЛЯ
 # =========================
 def kb_start_no_profile() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1034,10 +1265,16 @@ def kb_main_menu(db: Database, user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=liked_btn_text, callback_data="likes:list")],
         [
             InlineKeyboardButton(text="💌 Мои мэтчи и Чат", callback_data="matches:list"),
-            InlineKeyboardButton(text="⚙️ Редактировать", callback_data="settings:open"),
+            InlineKeyboardButton(text="⚙️ Настройки анкеты", callback_data="settings:open"),
         ],
-        [InlineKeyboardButton(text="🎁 Бесплатный VIP (Рефералка)", callback_data="ref:menu")],
+        [
+            InlineKeyboardButton(text="🎁 Бонус дня", callback_data="bonus:daily"),
+            InlineKeyboardButton(text="👥 Бесплатный VIP", callback_data="ref:menu"),
+        ],
     ]
+    if p and int(p["verified"]) == 0:
+        rows.append([InlineKeyboardButton(text="✅ Подтвердить анкету (+1 💌 в подарок)", callback_data="verify:start")])
+
     if is_adult and PAYMENTS_ENABLED:
         rows.append([InlineKeyboardButton(text="👑 Магазин привилегий и VIP", callback_data="shop:menu")])
 
@@ -1064,13 +1301,29 @@ def kb_form_nav(
     if extra_rows:
         rows.extend(extra_rows)
     if allow_skip_photo:
-        rows.append([InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="form:skip_photo")])
+        rows.append([InlineKeyboardButton(text="⏭ Пропустить фото/видео", callback_data="form:skip_photo")])
 
     nav_row: List[InlineKeyboardButton] = []
     if back_step:
         nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"form:back:{back_step}"))
     nav_row.append(InlineKeyboardButton(text="❌ Отмена", callback_data="form:cancel"))
     rows.append(nav_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_interests_selector(selected: Set[str], done_callback: str, back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    items = list(INTERESTS_MAP.items())
+    for i in range(0, len(items), 2):
+        row: List[InlineKeyboardButton] = []
+        for k, label in items[i : i + 2]:
+            mark = "✅ " if k in selected else ""
+            row.append(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"int_toggle:{k}"))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text=f"🚀 Готово (выбрано: {len(selected)})", callback_data=done_callback)])
+    if back_callback:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1108,32 +1361,47 @@ def kb_shop_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_settings(active: bool) -> InlineKeyboardMarkup:
+def kb_settings(active: bool, is_verified: bool, is_adult: bool) -> InlineKeyboardMarkup:
     toggle_text = "⏸ Скрыть мою анкету из поиска" if active else "▶️ Включить показ анкеты"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📸 Сменить фото", callback_data="edit:photo"),
-                InlineKeyboardButton(text="💬 Изменить «О себе»", callback_data="edit:bio"),
-            ],
-            [
-                InlineKeyboardButton(text="🏙 Сменить город", callback_data="edit:city"),
-                InlineKeyboardButton(text="🚻 Пол / Кого ищу", callback_data="edit:prefs"),
-            ],
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="📸 Сменить фото/видео", callback_data="edit:photo"),
+            InlineKeyboardButton(text="💬 Изменить «О себе»", callback_data="edit:bio"),
+        ],
+        [
+            InlineKeyboardButton(text="🏙 Сменить город", callback_data="edit:city"),
+            InlineKeyboardButton(text="🎯 Мои интересы", callback_data="edit:interests"),
+        ],
+        [
+            InlineKeyboardButton(text="🚻 Пол / Кого ищу", callback_data="edit:prefs"),
+        ],
+    ]
+    if is_adult:
+        rows[-1].append(InlineKeyboardButton(text="🎂 Возраст поиска", callback_data="edit:agerange"))
+
+    if not is_verified:
+        rows.append([InlineKeyboardButton(text="✅ Верифицировать профиль кружочком", callback_data="verify:start")])
+
+    rows.extend(
+        [
             [InlineKeyboardButton(text="✏️ Заполнить всю анкету заново", callback_data="profile:create")],
             [InlineKeyboardButton(text=toggle_text, callback_data="settings:toggle_active")],
-            [
-                InlineKeyboardButton(text="⭐️ Отзывы о боте", callback_data="reviews:menu"),
-                InlineKeyboardButton(text="🛠 Сообщить об ошибке", url=SUPPORT_URL),
-            ],
             [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def format_profile_card(p: sqlite3.Row, title: str = "Анкета участника", show_prefs: bool = False) -> str:
+def format_profile_card(
+    p: sqlite3.Row,
+    title: str = "Анкета участника",
+    show_prefs: bool = False,
+    viewer: Optional[sqlite3.Row] = None,
+) -> str:
     now = int(time.time())
     badges: List[str] = []
+    if int(p["verified"] or 0) == 1:
+        badges.append("✅ Проверено")
     if int(p["vip_until"]) > now:
         badges.append("👑 VIP")
     if int(p["boost_until"]) > now:
@@ -1141,25 +1409,37 @@ def format_profile_card(p: sqlite3.Row, title: str = "Анкета участн�
     badge_str = f" [{' | '.join(badges)}]" if badges else ""
 
     gender_str = format_gender_label(str(p["gender"] or "M"))
-    prefs_line = (
-        f"🔍 <b>Ищу:</b> {format_looking_for_label(str(p['looking_for'] or 'A'))}\n"
-        if show_prefs
-        else ""
-    )
+    online_str = format_online_status(int(p["last_active"] or 0))
+
+    prefs_line = ""
+    if show_prefs:
+        age_range_str = f"{p['min_pref_age']}–{p['max_pref_age']} лет"
+        prefs_line = f"🔍 <b>Ищу:</b> {format_looking_for_label(str(p['looking_for'] or 'A'))} ({age_range_str})\n"
+
+    interests_raw = str(p["interests"] or "")
+    interests_line = f"🎯 <b>Интересы:</b> {format_interests_list(interests_raw)}\n" if interests_raw else ""
+
+    compat_line = ""
+    if viewer and int(viewer["user_id"]) != int(p["user_id"]):
+        score, common = calc_compatibility(viewer, p)
+        common_str = f" (Общее: {', '.join(common[:3])})" if common else ""
+        compat_line = f"🔥 <b>Совместимость с тобой:</b> {score}%{common_str}\n"
 
     return (
         f"💘 <b>{esc(title)}</b>{badge_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Имя:</b> {esc(p['name'])}, {int(p['age'])} лет ({gender_str})\n"
-        f"📍 <b>Город:</b> {esc(p['city'])}\n"
-        f"{prefs_line}\n"
+        f"📍 <b>Город:</b> {esc(p['city'])}  •  {online_str}\n"
+        f"{prefs_line}"
+        f"{interests_line}"
+        f"{compat_line}\n"
         f"💬 <b>О себе:</b>\n"
         f"<blockquote>{esc(p['bio'])}</blockquote>"
     )
 
 
 # =========================
-# РОУТЕР И ОБРАБОТЧИКИ
+# РОУТЕР И ГЛАВНОЕ МЕНЮ
 # =========================
 router = Router()
 
@@ -1171,18 +1451,26 @@ async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[s
             "💘 <b>Добро пожаловать в сервис знакомств «Лавчик»!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Здесь ты легко найдёшь новых друзей, яркое общение или свою вторую половинку в своём городе.\n\n"
-            "✨ Точный подбор по полу, возрасту и городу\n"
-            "💬 Встроенный чат для общения прямо внутри бота\n"
-            "💌 Мгновенные уведомления о взаимных симпатиях\n"
-            "🎁 Щедрая реферальная программа с бесплатным VIP\n\n"
+            "✨ Умный подбор по полу, интересам и совместимости\n"
+            "🎥 Поддержка живых фото и видео-анкет\n"
+            "💬 Встроенный чат и «Ледоколы» для лёгкого старта общения\n"
+            "✅ Верификация анкет против фейков\n\n"
             "👇 <b>Нажми кнопку ниже, чтобы создать анкету за 30 секунд:</b>"
         )
         await send_screen(bot, user_id, text, reply_markup=kb_start_no_profile())
         return
 
-    if username is not None and username != p["username"]:
-        db.sync_username(user_id, username)
-        p = db.get_profile(user_id) or p
+    if int(p["banned"] or 0) == 1:
+        await send_screen(
+            bot,
+            user_id,
+            "🚫 <b>Твоя анкета заблокирована модератором за нарушение правил сообщества.</b>\n"
+            f"Если ты считаешь, что произошла ошибка, напиши в поддержку: {SUPPORT_URL}",
+        )
+        return
+
+    db.touch_user(user_id, username=username)
+    p = db.get_profile(user_id) or p
 
     now = int(time.time())
     vip_active = int(p["vip_until"]) > now
@@ -1211,6 +1499,7 @@ async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[s
         text,
         reply_markup=kb_main_menu(db, user_id),
         photo_id=p["photo_id"] if p["photo_id"] else None,
+        media_type=str(p["media_type"] or "photo"),
     )
 
 
@@ -1236,6 +1525,104 @@ async def cb_menu_home(call: CallbackQuery, state: FSMContext, db: Database, bot
     await state.clear()
     await call.answer()
     await render_home(bot, db, call.from_user.id, username=call.from_user.username)
+
+
+# =========================
+# ЕЖЕДНЕВНЫЙ БОНУС И ВЕРИФИКАЦИЯ КРУЖОЧКОМ
+# =========================
+@router.callback_query(F.data == "bonus:daily")
+async def cb_daily_bonus(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    ok, hours_left = db.claim_daily_bonus(uid)
+    if not ok:
+        await call.answer(
+            f"⏳ Ты уже забирал сегодняшний подарок! Следующий бонус будет доступен через {hours_left} ч.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer("🎁 Бонус получен: +2 часа ТОП-продвижения!", show_alert=True)
+    await render_home(bot, db, uid, username=call.from_user.username)
+
+
+@router.callback_query(F.data == "verify:start")
+async def cb_verify_start(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer("Сначала создай анкету!", show_alert=True)
+        return
+    if int(p["verified"] or 0) == 1:
+        await call.answer("Твоя анкета уже верифицирована ✅", show_alert=True)
+        return
+
+    await call.answer()
+    await state.set_state(VerifyForm.waiting_video_note)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")]]
+    )
+    await send_screen(
+        bot,
+        uid,
+        "✅ <b>Верификация анкеты (Значок «Проверено»)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Подтверждённые анкеты вызывают максимум доверия, показываются выше в поиске и получают <b>+1 💌 Супер-письмо в подарок</b>!\n\n"
+        "📹 <b>Как пройти за 5 секунд:</b>\n"
+        "Зажми иконку видеосообщения («кружочка») в Telegram, покажи лицо и помаши рукой в камеру 👇",
+        reply_markup=kb,
+    )
+
+
+@router.message(VerifyForm.waiting_video_note, F.video_note)
+async def msg_verify_video_note(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    uid = message.from_user.id
+    await state.clear()
+
+    first_time = db.set_verified(uid, True)
+    bonus_str = "\n🎁 Тебе начислено <b>+1 💌 Супер-письмо</b> в подарок!" if first_time else ""
+
+    if ADMIN_ID > 0:
+        try:
+            p = db.get_profile(uid)
+            await bot.send_video_note(ADMIN_ID, video_note=message.video_note.file_id)
+            await bot.send_message(
+                ADMIN_ID,
+                f"✅ <b>Верификация кружочком:</b> {esc(p['name'] if p else uid)} (ID: <code>{uid}</code>)",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="❌ Снять галочку", callback_data=f"adminmod:unverify:{uid}")],
+                        [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adminmod:ban:{uid}")],
+                    ]
+                ),
+            )
+        except Exception:
+            pass
+
+    await send_screen(
+        bot,
+        uid,
+        f"🎉 <b>Твоя анкета успешно подтверждена и получила значок «✅ Проверено»!</b>{bonus_str}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]
+        ),
+    )
+
+
+@router.message(VerifyForm.waiting_video_note)
+async def msg_verify_invalid(message: Message, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await send_screen(
+        bot,
+        message.from_user.id,
+        "⚠️ <b>Пожалуйста, запиши именно круглое видеосообщение («кружочек») через камеру Telegram:</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="menu:home")]]
+        ),
+    )
 
 
 # =========================
@@ -1515,14 +1902,14 @@ async def cb_admin_delete_review(call: CallbackQuery, db: Database) -> None:
 
 
 # =========================
-# 7-ШАГОВАЯ АНКЕТА С ВЫБОРОМ ПОЛА И КНОПКОЙ "НАЗАД"
+# СОЗДАНИЕ АНКЕТЫ (ИМЯ, ПОЛ, КОГО ИЩУ, ВОЗРАСТ, ГОРОД, ИНТЕРЕСЫ, О СЕБЕ, ФОТО/ВИДЕО)
 # =========================
 async def ask_step_name(bot: Bot, user_id: int, state: FSMContext) -> None:
     await state.set_state(ProfileForm.name)
     await send_screen(
         bot,
         user_id,
-        "📝 <b>Создание анкеты (Шаг 1 из 7)</b>\n"
+        "📝 <b>Создание анкеты (Шаг 1 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Как тебя зовут? Напиши своё имя в чат:",
         reply_markup=kb_form_nav(back_step=None),
@@ -1540,7 +1927,7 @@ async def ask_step_gender(bot: Bot, user_id: int, state: FSMContext) -> None:
     await send_screen(
         bot,
         user_id,
-        "🚻 <b>Создание анкеты (Шаг 2 из 7)</b>\n"
+        "🚻 <b>Создание анкеты (Шаг 2 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Укажи свой пол (нажми на кнопку ниже):",
         reply_markup=kb_form_nav(back_step="name", extra_rows=gender_buttons),
@@ -1559,7 +1946,7 @@ async def ask_step_looking_for(bot: Bot, user_id: int, state: FSMContext) -> Non
     await send_screen(
         bot,
         user_id,
-        "🔍 <b>Создание анкеты (Шаг 3 из 7)</b>\n"
+        "🔍 <b>Создание анкеты (Шаг 3 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Кого ты хочешь найти в боте?",
         reply_markup=kb_form_nav(back_step="gender", extra_rows=looking_buttons),
@@ -1571,7 +1958,7 @@ async def ask_step_age(bot: Bot, user_id: int, state: FSMContext) -> None:
     await send_screen(
         bot,
         user_id,
-        "🎂 <b>Создание анкеты (Шаг 4 из 7)</b>\n"
+        "🎂 <b>Создание анкеты (Шаг 4 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Сколько тебе лет? Отправь число от <b>14</b> до <b>80</b>:",
         reply_markup=kb_form_nav(back_step="looking_for"),
@@ -1597,10 +1984,24 @@ async def ask_step_city(bot: Bot, user_id: int, state: FSMContext) -> None:
     await send_screen(
         bot,
         user_id,
-        "🏙 <b>Создание анкеты (Шаг 5 из 7)</b>\n"
+        "🏙 <b>Создание анкеты (Шаг 5 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Из какого ты города? Выбери кнопкой ниже или <b>напиши название своего города</b> в чат:",
         reply_markup=kb_form_nav(back_step="age", extra_rows=quick_cities),
+    )
+
+
+async def ask_step_interests(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.interests)
+    data = await state.get_data()
+    selected = parse_interests(str(data.get("interests", "")))
+    await send_screen(
+        bot,
+        user_id,
+        "🎯 <b>Создание анкеты (Шаг 6 из 8)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Выбери до 5 своих интересов (по ним бот будет считать <b>% совместимости</b> с другими людьми), затем нажми «🚀 Готово»:",
+        reply_markup=kb_interests_selector(selected, done_callback="form:interests_done", back_callback="form:back:city"),
     )
 
 
@@ -1609,10 +2010,10 @@ async def ask_step_bio(bot: Bot, user_id: int, state: FSMContext) -> None:
     await send_screen(
         bot,
         user_id,
-        "💬 <b>Создание анкеты (Шаг 6 из 7)</b>\n"
+        "💬 <b>Создание анкеты (Шаг 7 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Расскажи немного о себе: чем увлекаешься, какую музыку слушаешь, кого хочешь найти?",
-        reply_markup=kb_form_nav(back_step="city"),
+        "Расскажи немного о себе: чем увлекаешься, кого хочешь найти?",
+        reply_markup=kb_form_nav(back_step="interests"),
     )
 
 
@@ -1621,9 +2022,10 @@ async def ask_step_photo(bot: Bot, user_id: int, state: FSMContext) -> None:
     await send_screen(
         bot,
         user_id,
-        "📸 <b>Создание анкеты (Шаг 7 из 7)</b>\n"
+        "📸 <b>Создание анкеты (Шаг 8 из 8)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Отправь своё лучшее фото для анкеты (с фото ты получишь в 5 раз больше лайков!) или нажми «Пропустить фото»:",
+        "Отправь своё лучшее <b>фото</b> или <b>короткое видео (до 15 сек)</b> для анкеты!\n\n"
+        "<i>С фото или видео ты получишь в 5 раз больше симпатий!</i>",
         reply_markup=kb_form_nav(back_step="bio", allow_skip_photo=True),
     )
 
@@ -1657,6 +2059,8 @@ async def cb_form_back(call: CallbackQuery, state: FSMContext, bot: Bot) -> None
         await ask_step_age(bot, uid, state)
     elif step == "city":
         await ask_step_city(bot, uid, state)
+    elif step == "interests":
+        await ask_step_interests(bot, uid, state)
     elif step == "bio":
         await ask_step_bio(bot, uid, state)
 
@@ -1685,24 +2089,12 @@ async def form_gender_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> No
     await ask_step_looking_for(bot, call.from_user.id, state)
 
 
-@router.message(ProfileForm.gender)
-async def form_gender_msg(message: Message, state: FSMContext, bot: Bot) -> None:
-    await delete_user_msg(message)
-    await ask_step_gender(bot, message.from_user.id, state)
-
-
 @router.callback_query(ProfileForm.looking_for, F.data.startswith("form:looking:"))
 async def form_looking_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
     looking_for = call.data.split(":")[2]
     await state.update_data(looking_for=looking_for)
     await ask_step_age(bot, call.from_user.id, state)
-
-
-@router.message(ProfileForm.looking_for)
-async def form_looking_msg(message: Message, state: FSMContext, bot: Bot) -> None:
-    await delete_user_msg(message)
-    await ask_step_looking_for(bot, message.from_user.id, state)
 
 
 @router.message(ProfileForm.age)
@@ -1726,7 +2118,7 @@ async def form_city_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None
     await call.answer()
     city = normalize_city(call.data.split(":", 2)[2])
     await state.update_data(city=city)
-    await ask_step_bio(bot, call.from_user.id, state)
+    await ask_step_interests(bot, call.from_user.id, state)
 
 
 @router.message(ProfileForm.city)
@@ -1742,7 +2134,31 @@ async def form_city(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
     await state.update_data(city=normalize_city(raw_city))
-    await ask_step_bio(bot, message.from_user.id, state)
+    await ask_step_interests(bot, message.from_user.id, state)
+
+
+@router.callback_query(ProfileForm.interests, F.data.startswith("int_toggle:"))
+async def form_interests_toggle(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    key = call.data.split(":")[1]
+    data = await state.get_data()
+    selected = parse_interests(str(data.get("interests", "")))
+    if key in selected:
+        selected.remove(key)
+    else:
+        if len(selected) >= 5:
+            await call.answer("Можно выбрать максимум 5 интересов!", show_alert=True)
+            return
+        selected.add(key)
+
+    await state.update_data(interests=",".join(selected))
+    await call.answer()
+    await ask_step_interests(bot, call.from_user.id, state)
+
+
+@router.callback_query(ProfileForm.interests, F.data == "form:interests_done")
+async def form_interests_done(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    await ask_step_bio(bot, call.from_user.id, state)
 
 
 @router.message(ProfileForm.bio)
@@ -1754,7 +2170,7 @@ async def form_bio(message: Message, state: FSMContext, bot: Bot) -> None:
             bot,
             message.from_user.id,
             "⚠️ <b>Описание должно быть от 10 до 500 символов.</b>\nНапиши чуть подробнее о себе:",
-            reply_markup=kb_form_nav(back_step="city"),
+            reply_markup=kb_form_nav(back_step="interests"),
         )
         return
     await state.update_data(bio=bio)
@@ -1762,7 +2178,13 @@ async def form_bio(message: Message, state: FSMContext, bot: Bot) -> None:
 
 
 async def finalize_profile_creation(
-    bot: Bot, db: Database, user_id: int, username: Optional[str], data: dict, photo_id: Optional[str]
+    bot: Bot,
+    db: Database,
+    user_id: int,
+    username: Optional[str],
+    data: dict,
+    photo_id: Optional[str],
+    media_type: str = "photo",
 ) -> None:
     is_new = db.upsert_profile(
         user_id=user_id,
@@ -1773,7 +2195,9 @@ async def finalize_profile_creation(
         age=int(data["age"]),
         city=str(data["city"]),
         bio=str(data["bio"]),
+        interests=str(data.get("interests", "")),
         photo_id=photo_id,
+        media_type=media_type,
     )
 
     if is_new:
@@ -1816,7 +2240,20 @@ async def form_photo_ok(message: Message, state: FSMContext, db: Database, bot: 
     photo_id = message.photo[-1].file_id
     data = await state.get_data()
     await state.clear()
-    await finalize_profile_creation(bot, db, message.from_user.id, message.from_user.username, data, photo_id=photo_id)
+    await finalize_profile_creation(
+        bot, db, message.from_user.id, message.from_user.username, data, photo_id=photo_id, media_type="photo"
+    )
+
+
+@router.message(ProfileForm.photo, F.video)
+async def form_video_ok(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    video_id = message.video.file_id
+    data = await state.get_data()
+    await state.clear()
+    await finalize_profile_creation(
+        bot, db, message.from_user.id, message.from_user.username, data, photo_id=video_id, media_type="video"
+    )
 
 
 @router.message(ProfileForm.photo)
@@ -1825,15 +2262,9 @@ async def form_photo_invalid(message: Message, state: FSMContext, bot: Bot) -> N
     await send_screen(
         bot,
         message.from_user.id,
-        "⚠️ <b>Пожалуйста, отправь именно фотографию</b> или нажми кнопку «Пропустить фото» ниже:",
+        "⚠️ <b>Пожалуйста, отправь фотографию или видео</b> (либо нажми кнопку «Пропустить» ниже):",
         reply_markup=kb_form_nav(back_step="bio", allow_skip_photo=True),
     )
-
-
-@router.callback_query(F.data == "profile:me")
-async def cb_profile_me(call: CallbackQuery, db: Database, bot: Bot) -> None:
-    await call.answer()
-    await render_home(bot, db, call.from_user.id, username=call.from_user.username)
 
 
 # =========================
@@ -1845,16 +2276,16 @@ async def cb_edit_photo(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
     await state.set_state(EditProfileForm.waiting_photo)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Удалить текущее фото", callback_data="edit:remove_photo")],
+            [InlineKeyboardButton(text="🗑 Удалить текущее фото/видео", callback_data="edit:remove_photo")],
             [InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data="settings:open")],
         ]
     )
     await send_screen(
         bot,
         call.from_user.id,
-        "📸 <b>Смена фотографии анкеты</b>\n"
+        "📸 <b>Смена фото или видео анкеты</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Отправь новую фотографию в чат:",
+        "Отправь новую <b>фотографию</b> или <b>короткое видео</b> в чат:",
         reply_markup=kb,
     )
 
@@ -1862,8 +2293,8 @@ async def cb_edit_photo(call: CallbackQuery, state: FSMContext, bot: Bot) -> Non
 @router.callback_query(EditProfileForm.waiting_photo, F.data == "edit:remove_photo")
 async def cb_edit_remove_photo(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
     await state.clear()
-    db.update_photo(call.from_user.id, None)
-    await call.answer("Фото удалено!")
+    db.update_media(call.from_user.id, None, "photo")
+    await call.answer("Медиа удалено!")
     await render_home(bot, db, call.from_user.id)
 
 
@@ -1871,7 +2302,15 @@ async def cb_edit_remove_photo(call: CallbackQuery, state: FSMContext, db: Datab
 async def msg_edit_photo_ok(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
     await delete_user_msg(message)
     await state.clear()
-    db.update_photo(message.from_user.id, message.photo[-1].file_id)
+    db.update_media(message.from_user.id, message.photo[-1].file_id, "photo")
+    await render_home(bot, db, message.from_user.id)
+
+
+@router.message(EditProfileForm.waiting_photo, F.video)
+async def msg_edit_video_ok(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    await state.clear()
+    db.update_media(message.from_user.id, message.video.file_id, "video")
     await render_home(bot, db, message.from_user.id)
 
 
@@ -1966,6 +2405,106 @@ async def msg_edit_city_ok(message: Message, state: FSMContext, db: Database, bo
     await render_home(bot, db, message.from_user.id)
 
 
+@router.callback_query(F.data == "edit:interests")
+async def cb_edit_interests(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        return
+    await call.answer()
+    await state.set_state(EditProfileForm.waiting_interests)
+    await state.update_data(edit_interests=str(p["interests"] or ""))
+    selected = parse_interests(str(p["interests"] or ""))
+    await send_screen(
+        bot,
+        uid,
+        "🎯 <b>Редактирование твоих интересов</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отметь до 5 близких тебе тем и нажми «🚀 Готово»:",
+        reply_markup=kb_interests_selector(selected, done_callback="edit:interests_save", back_callback="settings:open"),
+    )
+
+
+@router.callback_query(EditProfileForm.waiting_interests, F.data.startswith("int_toggle:"))
+async def cb_edit_interests_toggle(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    key = call.data.split(":")[1]
+    data = await state.get_data()
+    selected = parse_interests(str(data.get("edit_interests", "")))
+    if key in selected:
+        selected.remove(key)
+    else:
+        if len(selected) >= 5:
+            await call.answer("Максимум 5 интересов!", show_alert=True)
+            return
+        selected.add(key)
+    new_raw = ",".join(selected)
+    await state.update_data(edit_interests=new_raw)
+    await call.answer()
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "🎯 <b>Редактирование твоих интересов</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Отметь до 5 близких тебе тем и нажми «🚀 Готово»:",
+        reply_markup=kb_interests_selector(selected, done_callback="edit:interests_save", back_callback="settings:open"),
+    )
+
+
+@router.callback_query(EditProfileForm.waiting_interests, F.data == "edit:interests_save")
+async def cb_edit_interests_save(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    data = await state.get_data()
+    await state.clear()
+    db.update_interests(call.from_user.id, str(data.get("edit_interests", "")))
+    await call.answer("Интересы сохранены! 🎯")
+    await render_home(bot, db, call.from_user.id)
+
+
+@router.callback_query(F.data == "edit:agerange")
+async def cb_edit_agerange(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p or int(p["age"]) < 18:
+        await call.answer("Доступно для анкет 18+", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(EditProfileForm.waiting_age_range)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎂 18 – 23 года", callback_data="agerange:18:23"),
+                InlineKeyboardButton(text="🎂 20 – 27 лет", callback_data="agerange:20:27"),
+            ],
+            [
+                InlineKeyboardButton(text="🎂 24 – 32 года", callback_data="agerange:24:32"),
+                InlineKeyboardButton(text="🎂 28 – 40 лет", callback_data="agerange:28:40"),
+            ],
+            [
+                InlineKeyboardButton(text="🎂 35 – 55 лет", callback_data="agerange:35:55"),
+                InlineKeyboardButton(text="🎂 18 – 80 (Все)", callback_data="agerange:18:80"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data="settings:open")],
+        ]
+    )
+    await send_screen(
+        bot,
+        uid,
+        f"🎂 <b>Возрастной диапазон поиска</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Сейчас выбран диапазон: <b>от {p['min_pref_age']} до {p['max_pref_age']} лет</b>.\n"
+        f"Выбери подходящий возраст кнопкой ниже:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(EditProfileForm.waiting_age_range, F.data.startswith("agerange:"))
+async def cb_edit_agerange_set(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
+    _, min_s, max_s = call.data.split(":")
+    await state.clear()
+    db.update_age_range(call.from_user.id, int(min_s), int(max_s))
+    await call.answer(f"Возраст поиска: {min_s}–{max_s} лет ✅")
+    await render_home(bot, db, call.from_user.id)
+
+
 @router.callback_query(F.data == "edit:prefs")
 async def cb_edit_prefs(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
@@ -2034,12 +2573,16 @@ async def show_next_candidate(bot: Bot, db: Database, user_id: int) -> None:
     if not me:
         await render_home(bot, db, user_id)
         return
+    if int(me["banned"] or 0) == 1:
+        await render_home(bot, db, user_id)
+        return
 
+    db.touch_user(user_id)
     candidate = db.find_candidate(user_id, city_prioritized=True)
     if not candidate:
         kb_rows: List[List[InlineKeyboardButton]] = [
             [InlineKeyboardButton(text="🔄 Смотреть пропущенные анкеты заново", callback_data="browse:free_reset")],
-            [InlineKeyboardButton(text="🚻 Изменить фильтр (Кого ищу)", callback_data="edit:prefs")],
+            [InlineKeyboardButton(text="🚻 Изменить фильтр поиска", callback_data="settings:open")],
             [InlineKeyboardButton(text="🎁 Пригласить друзей (+VIP)", callback_data="ref:menu")],
             [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")],
         ]
@@ -2050,18 +2593,19 @@ async def show_next_candidate(bot: Bot, db: Database, user_id: int) -> None:
             "🔍 <b>Новые анкеты по твоим параметрам пока закончились!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Ты просмотрел всех доступных участников.\n\n"
-            "💡 <i>Нажми кнопку ниже, чтобы сбросить пропущенные анкеты («Дальше 👎») и посмотреть их снова, или пригласи друзей!</i>",
+            "💡 <i>Нажми кнопку ниже, чтобы сбросить пропущенные анкеты («Дальше 👎») и посмотреть их снова!</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         )
         return
 
-    text = format_profile_card(candidate, title="Найдена анкета")
+    text = format_profile_card(candidate, title="Найдена анкета", viewer=me)
     await send_screen(
         bot,
         user_id,
         text,
         reply_markup=kb_candidate(int(candidate["user_id"])),
         photo_id=candidate["photo_id"] if candidate["photo_id"] else None,
+        media_type=str(candidate["media_type"] or "photo"),
     )
 
 
@@ -2082,7 +2626,7 @@ async def cb_browse_free_reset(call: CallbackQuery, db: Database, bot: Bot) -> N
 async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
     user_id = call.from_user.id
     me = db.get_profile(user_id)
-    if not me:
+    if not me or int(me["banned"] or 0) == 1:
         await call.answer()
         await render_home(bot, db, user_id)
         return
@@ -2091,7 +2635,7 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
     target_id = int(raw_target)
     target = db.get_profile(target_id)
 
-    if not target or int(target["active"]) == 0:
+    if not target or int(target["active"]) == 0 or int(target["banned"] or 0) == 1:
         await call.answer("Эта анкета больше не активна.")
         await show_next_candidate(bot, db, user_id)
         return
@@ -2141,6 +2685,7 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
                 if target["username"]
                 else f"<a href='tg://user?id={target_id}'>{esc(target['name'])}</a>"
             )
+            compat_score, _ = calc_compatibility(me, target)
 
             try:
                 await bot.send_message(
@@ -2148,11 +2693,13 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
                     f"💞 <b>У тебя взаимная симпатия (Мэтч)!</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Ты и <b>{esc(me['name'])}</b> ({me['age']}, {esc(me['city'])}) понравились друг другу!\n"
+                    f"🔥 Ваша совместимость: <b>{compat_score}%</b>\n"
                     f"🔗 Контакт в Telegram: {my_link}\n\n"
-                    f"💬 <i>Нажми кнопку ниже, чтобы написать сообщение прямо через бота:</i>",
+                    f"💬 <i>Начни общение прямо сейчас или отправь «Ледокол» (случайный вопрос) в 1 клик:</i>",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
-                            [InlineKeyboardButton(text=f"💬 Написать {me['name']} через бота", callback_data=f"chat:write:{user_id}")],
+                            [InlineKeyboardButton(text=f"💬 Написать {me['name']}", callback_data=f"chat:write:{user_id}")],
+                            [InlineKeyboardButton(text="🎲 Отправить Ледокол (Идея для старта)", callback_data=f"chat:ice:{user_id}")],
                             [InlineKeyboardButton(text="🔥 Продолжить поиск", callback_data="browse:next")],
                         ]
                     ),
@@ -2167,17 +2714,19 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
                 f"💞 <b>Это взаимный Мэтч!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Ты понравился(ась) <b>{esc(target['name'])}</b> ({target['age']}, {esc(target['city'])})!\n"
+                f"🔥 Ваша совместимость: <b>{compat_score}%</b>\n"
                 f"🔗 Контакт в Telegram: {target_link}\n\n"
-                f"💬 <i>Даже если у собеседника скрыт профиль, ты можешь написать ему прямо через бота кнопкой ниже!</i>",
+                f"💬 <i>Не знаешь, с чего начать? Нажми «🎲 Отправить Ледокол» или напиши своё сообщение через бота:</i>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text=f"💬 Написать {target['name']} через бота", callback_data=f"chat:write:{target_id}")],
+                        [InlineKeyboardButton(text="🎲 Отправить Ледокол (Случайный вопрос)", callback_data=f"chat:ice:{target_id}")],
                         [InlineKeyboardButton(text="🔥 Смотреть анкеты дальше", callback_data="browse:next")],
-                        [InlineKeyboardButton(text="💌 Все мои мэтчи", callback_data="matches:list")],
                         [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="menu:home")],
                     ]
                 ),
                 photo_id=target["photo_id"] if target["photo_id"] else None,
+                media_type=str(target["media_type"] or "photo"),
             )
             return
         else:
@@ -2201,8 +2750,57 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
 
 
 # =========================
-# ВСТРОЕННЫЙ ЧАТ МЕЖДУ ПОЛЬЗОВАТЕЛЯМИ ЧЕРЕЗ БОТА
+# ВСТРОЕННЫЙ ЧАТ И "ЛЕДОКОЛЫ"
 # =========================
+@router.callback_query(F.data.startswith("chat:ice:"))
+async def cb_chat_icebreaker(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    me = db.get_profile(uid)
+    target_id = int(call.data.split(":")[2])
+    target = db.get_profile(target_id)
+
+    if not me or not target or db.is_blocked_between(uid, target_id):
+        await call.answer("Недоступно.", show_alert=True)
+        return
+
+    ice_text = random.choice(ICEBREAKERS)
+    db.log_chat_message(uid, target_id, ice_text)
+    my_link = f" (@{esc(me['username'])})" if me["username"] else ""
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"💬 <b>Сообщение от {esc(me['name'])}{my_link}</b> ({me['age']}, {esc(me['city'])}):\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<blockquote>{esc(ice_text)}</blockquote>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=f"↩️ Ответить {me['name']}", callback_data=f"chat:write:{uid}")],
+                    [InlineKeyboardButton(text="🎲 Ответить своим Ледоколом", callback_data=f"chat:ice:{uid}")],
+                ]
+            ),
+        )
+    except Exception:
+        await call.answer("Не удалось доставить сообщение.", show_alert=True)
+        return
+
+    await call.answer("🎲 Ледокол отправлен!")
+    await send_screen(
+        bot,
+        uid,
+        f"✅ <b>Ты отправил(а) вопрос-ледокол для {esc(target['name'])}:</b>\n\n"
+        f"<blockquote>{esc(ice_text)}</blockquote>\n\n"
+        f"<i>Как только собеседник ответит, сообщение придёт прямо сюда!</i>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"✍️ Написать ещё {target['name']}", callback_data=f"chat:write:{target_id}")],
+                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
+            ]
+        ),
+    )
+
+
 @router.callback_query(F.data.startswith("chat:write:"))
 async def cb_chat_write(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
     uid = call.from_user.id
@@ -2213,7 +2811,7 @@ async def cb_chat_write(call: CallbackQuery, state: FSMContext, db: Database, bo
 
     target_id = int(call.data.split(":")[2])
     target = db.get_profile(target_id)
-    if not target or int(target["active"]) == 0:
+    if not target or int(target["active"]) == 0 or int(target["banned"] or 0) == 1:
         await call.answer("Пользователь больше не активен.", show_alert=True)
         return
 
@@ -2231,10 +2829,11 @@ async def cb_chat_write(call: CallbackQuery, state: FSMContext, db: Database, bo
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Отправить случайный вопрос (Ледокол)", callback_data=f"chat:ice:{target_id}")],
             [
                 InlineKeyboardButton(text="💌 К списку мэтчей", callback_data="matches:list"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="menu:home"),
-            ]
+            ],
         ]
     )
     await send_screen(
@@ -2242,7 +2841,7 @@ async def cb_chat_write(call: CallbackQuery, state: FSMContext, db: Database, bo
         uid,
         f"💬 <b>Сообщение для {esc(target['name'])} ({target['age']}, {esc(target['city'])})</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Напиши своё сообщение в чат, и бот мгновенно доставит его собеседнику:",
+        f"Напиши своё сообщение в чат (или нажми кнопку «🎲 Ледокол» ниже):",
         reply_markup=kb,
     )
 
@@ -2300,7 +2899,7 @@ async def msg_chat_send(message: Message, state: FSMContext, db: Database, bot: 
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Твой текст:\n<blockquote>{esc(text)}</blockquote>"
         if delivered
-        else f"⚠️ <b>Не удалось доставить сообщение:</b> пользователь остановил бота."
+        else "⚠️ <b>Не удалось доставить сообщение:</b> пользователь остановил бота."
     )
 
     await send_screen(
@@ -2380,13 +2979,14 @@ async def cb_likes_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
 
     await call.answer()
     first = admirers[0]
-    text = format_profile_card(first, title=f"Тебя лайкнули! (Ещё {len(admirers)} чел.)")
+    text = format_profile_card(first, title=f"Тебя лайкнули! (Ещё {len(admirers)} чел.)", viewer=me)
     await send_screen(
         bot,
         uid,
         text,
         reply_markup=kb_candidate(int(first["user_id"])),
         photo_id=first["photo_id"] if first["photo_id"] else None,
+        media_type=str(first["media_type"] or "photo"),
     )
 
 
@@ -2497,7 +3097,7 @@ async def msg_super_send(message: Message, state: FSMContext, db: Database, bot:
 
 
 # =========================
-# МЭТЧИ, ЖАЛОБЫ И НАСТРОЙКИ
+# МЭТЧИ, МОДЕРАЦИЯ ЖАЛОБ И НАСТРОЙКИ
 # =========================
 @router.callback_query(F.data == "matches:list")
 async def cb_matches_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
@@ -2517,14 +3117,17 @@ async def cb_matches_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
         lines = [
             "💌 <b>Твои взаимные симпатии (Мэтчи):</b>",
             "━━━━━━━━━━━━━━━━━━━━",
-            "<i>Нажми на кнопку с именем человека ниже, чтобы написать ему сообщение прямо через бота, или перейди по его @username:</i>\n",
+            "<i>Нажми на кнопку с именем человека ниже, чтобы написать ему сообщение или отправить вопрос-ледокол:</i>\n",
         ]
         for m in matches:
             mid = int(m["user_id"])
-            link = f"@{esc(m['username'])}" if m["username"] else "профиль скрыт (пиши кнопкой ниже)"
+            link = f"@{esc(m['username'])}" if m["username"] else "пиши кнопкой ниже"
             lines.append(f"• <b>{esc(m['name'])}</b>, {m['age']} ({esc(m['city'])}) — {link}")
             kb_rows.append(
-                [InlineKeyboardButton(text=f"💬 Написать {m['name']} ({m['city']})", callback_data=f"chat:write:{mid}")]
+                [
+                    InlineKeyboardButton(text=f"💬 Написать {m['name']}", callback_data=f"chat:write:{mid}"),
+                    InlineKeyboardButton(text="🎲 Ледокол", callback_data=f"chat:ice:{mid}"),
+                ]
             )
         text = "\n".join(lines)
 
@@ -2549,16 +3152,55 @@ async def cb_safety(call: CallbackQuery, db: Database, bot: Bot) -> None:
         db.block_user(uid, target_id)
         db.record_reaction(uid, target_id, "skip")
         if ADMIN_ID > 0:
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ <b>Жалоба на анкету</b>\nОт: <code>{uid}</code>\nНа: <code>{target_id}</code>",
+            target_p = db.get_profile(target_id)
+            if target_p:
+                mod_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🚫 Забанить нарушителя", callback_data=f"adminmod:ban:{target_id}")],
+                        [InlineKeyboardButton(text="✅ Оставить анкету", callback_data="adminmod:ignore")],
+                    ]
                 )
-            except Exception:
-                pass
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ <b>Жалоба на анкету!</b>\n"
+                        f"Отправитель жалобы: <code>{uid}</code>\n"
+                        f"Нарушитель: <code>{target_id}</code> (@{esc(target_p['username'] or 'нет')})\n\n"
+                        f"{format_profile_card(target_p, title='Подозрительная анкета')}",
+                        reply_markup=mod_kb,
+                    )
+                except Exception:
+                    pass
         await call.answer("Жалоба отправлена модераторам ⚠️")
 
     await show_next_candidate(bot, db, uid)
+
+
+@router.callback_query(F.data.startswith("adminmod:"))
+async def cb_admin_moderation(call: CallbackQuery, db: Database) -> None:
+    if call.from_user.id != ADMIN_ID:
+        return
+    parts = call.data.split(":")
+    action = parts[1]
+    if action == "ignore":
+        await call.answer("Жалоба отклонена")
+        try:
+            await call.message.edit_text("✅ Жалоба рассмотрена (анкета оставлена).")
+        except Exception:
+            pass
+        return
+
+    target_uid = int(parts[2])
+    if action == "ban":
+        db.set_banned(target_uid, True)
+        await call.answer("Пользователь заблокирован в боте! 🚫", show_alert=True)
+        try:
+            await call.message.edit_text(f"🚫 Пользователь <code>{target_uid}</code> заблокирован навсегда.")
+        except Exception:
+            pass
+    elif action == "unverify":
+        db.set_verified(target_uid, False)
+        await call.answer("Галочка верификации снята!", show_alert=True)
 
 
 @router.callback_query(F.data == "settings:open")
@@ -2572,21 +3214,24 @@ async def cb_settings_open(call: CallbackQuery, state: FSMContext, db: Database,
         return
     await call.answer()
     active = int(p["active"]) == 1
-    status_str = "🟢 Твоя анкета видна в поиске" if active else "⏸ Твоя анкета скрыта"
+    is_verified = int(p["verified"] or 0) == 1
+    is_adult = int(p["age"]) >= 18
+    status_str = "🟢 Видна в поиске" if active else "⏸ Скрыта"
     gender_str = format_gender_label(str(p["gender"] or "M"))
     looking_str = format_looking_for_label(str(p["looking_for"] or "A"))
 
     await send_screen(
         bot,
         uid,
-        f"⚙️ <b>Настройки и редактирование анкеты</b>\n"
+        f"⚙️ <b>Настройки и фильтры анкеты</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 <b>Статус:</b> {status_str}\n"
+        f"📡 <b>Статус показа:</b> {status_str}\n"
         f"🚻 <b>Твой пол:</b> {gender_str}\n"
-        f"🔍 <b>Кого ищешь:</b> {looking_str}\n"
-        f"📍 <b>Город:</b> {esc(p['city'])}\n\n"
-        f"👇 <i>Выбери, что хочешь изменить:</i>",
-        reply_markup=kb_settings(active),
+        f"🔍 <b>Кого ищешь:</b> {looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)\n"
+        f"📍 <b>Город:</b> {esc(p['city'])}\n"
+        f"🎯 <b>Интересы:</b> {format_interests_list(str(p['interests'] or ''))}\n\n"
+        f"👇 <i>Выбери, что хочешь настроить:</i>",
+        reply_markup=kb_settings(active, is_verified, is_adult),
     )
 
 
@@ -2601,21 +3246,24 @@ async def cb_settings_toggle(call: CallbackQuery, db: Database, bot: Bot) -> Non
     db.set_active(uid, new_active)
     await call.answer("Статус анкеты изменён!")
     p = db.get_profile(uid) or p
-    status_str = "🟢 Твоя анкета видна в поиске" if new_active else "⏸ Твоя анкета скрыта"
+    is_verified = int(p["verified"] or 0) == 1
+    is_adult = int(p["age"]) >= 18
+    status_str = "🟢 Видна в поиске" if new_active else "⏸ Скрыта"
     gender_str = format_gender_label(str(p["gender"] or "M"))
     looking_str = format_looking_for_label(str(p["looking_for"] or "A"))
 
     await send_screen(
         bot,
         uid,
-        f"⚙️ <b>Настройки и редактирование анкеты</b>\n"
+        f"⚙️ <b>Настройки и фильтры анкеты</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 <b>Статус:</b> {status_str}\n"
+        f"📡 <b>Статус показа:</b> {status_str}\n"
         f"🚻 <b>Твой пол:</b> {gender_str}\n"
-        f"🔍 <b>Кого ищешь:</b> {looking_str}\n"
-        f"📍 <b>Город:</b> {esc(p['city'])}\n\n"
-        f"👇 <i>Выбери, что хочешь изменить:</i>",
-        reply_markup=kb_settings(new_active),
+        f"🔍 <b>Кого ищешь:</b> {looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)\n"
+        f"📍 <b>Город:</b> {esc(p['city'])}\n"
+        f"🎯 <b>Интересы:</b> {format_interests_list(str(p['interests'] or ''))}\n\n"
+        f"👇 <i>Выбери, что хочешь настроить:</i>",
+        reply_markup=kb_settings(new_active, is_verified, is_adult),
     )
 
 
@@ -2976,7 +3624,7 @@ async def render_admin_panel(bot: Bot, db: Database, user_id: int) -> None:
     text = (
         "🛠 <b>Панель управления (Администратор)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Всего анкет в базе:</b> {stats['users']}\n"
+        f"👥 <b>Всего анкет в базе:</b> {stats['users']} (✅ Проверено: {stats['verified']})\n"
         f"💞 <b>Всего взаимных мэтчей:</b> {stats['matches']}\n"
         f"🎁 <b>Пришло по рефералке:</b> {stats['refs']}\n"
         f"👑 <b>Активных VIP:</b> {stats['vips']}\n"
