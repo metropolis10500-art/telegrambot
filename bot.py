@@ -60,15 +60,26 @@ FREE_DAILY_LIKES = 25
 # =========================
 # Подставьте реальные file_id стикеров от вашего бота (узнать можно через @Stickers или @GetStickerBot)
 STICKERS: Dict[str, str] = {
+    # Основные экраны
     "welcome": "",        # приветствие / старт
+    "empty_profile": "",  # когда нет анкеты
+    # Действия с анкетами
     "like": "",           # поставили лайк
-    "match": "",          # взаимный мэтч
+    "super_like": "",     # супер-лайк / супер-письмо
     "skip": "",           # пропустили анкету
-    "super_msg": "",      # супер-письмо
+    "match": "",          # взаимный мэтч
+    "match_super": "",    # крутой мэтч с анимацией
+    # Бонусы и покупки
     "daily_bonus": "",    # бонус дня
-    "error": "",          # ошибка / лимит
+    "purchase": "",       # успешная покупка
     "vip": "",            # покупка VIP
+    "coins": "",          # монеты / заработок
+    # Ошибки и лимиты
+    "error": "",          # ошибка / лимит
+    "no_candidates": "",  # анкеты закончились
+    # Навигация
     "bye": "",            # прощание / отмена
+    "back": "",           # возврат назад
 }
 
 
@@ -78,6 +89,90 @@ async def send_chat_action(bot: Bot, user_id: int, action: str) -> None:
         await bot.send_chat_action(chat_id=user_id, action=action)
     except Exception:
         pass
+
+
+async def send_sticker(bot: Bot, user_id: int, key: str) -> None:
+    """Отправить стикер по ключу, если задан file_id."""
+    sticker_id = STICKERS.get(key, "")
+    if not sticker_id:
+        return
+    try:
+        await bot.send_sticker(chat_id=user_id, sticker=sticker_id)
+    except Exception:
+        pass
+
+
+async def dice_animation(bot: Bot, chat_id: int, duration_seconds: float = 1.5) -> str:
+    """
+    Показывает анимацию броска кубика редактированием временного сообщения.
+    Возвращает 最終 выпавшее значение (1-6) в виде строки с эмодзи.
+    """
+    faces = ["🎲", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
+    import asyncio as _asyncio
+
+    temp_msg = await bot.send_message(chat_id=chat_id, text="🎲 Бросаем кубик…")
+    try:
+        steps = int(duration_seconds * 4)  # 4 кадра в секунду
+        for i in range(steps):
+            face = random.choice(faces[1:])  # без пустого кубика
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=temp_msg.message_id,
+                text=f"🎲 Бросаем кубик… {face}",
+            )
+            await _asyncio.sleep(0.25)
+        final_face = random.choice(faces[1:])
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=temp_msg.message_id,
+            text=f"🎲 Выпало: {final_face}",
+        )
+        await _asyncio.sleep(0.4)
+        await bot.delete_message(chat_id=chat_id, message_id=temp_msg.message_id)
+    except Exception:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=temp_msg.message_id)
+        except Exception:
+            pass
+    return final_face
+
+
+async def typing_animation(bot: Bot, chat_id: int, duration_seconds: float = 1.0) -> None:
+    """Имитация_print("печатает") с паузой для реалистичности."""
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        await asyncio.sleep(duration_seconds)
+    except Exception:
+        pass
+
+
+async def hearts_animation(bot: Bot, chat_id: int, count: int = 5) -> None:
+    """Анимация летящих сердец при лайке/мэтче."""
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text="❤️" * count)
+        await asyncio.sleep(0.8)
+        await bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+    except Exception:
+        pass
+
+
+def celebration_line(text: str) -> str:
+    """Праздничная строка с конфетти."""
+    return f"🎉 {text} 🎉"
+
+
+def progress_bar(current: int, maximum: int, length: int = 10) -> str:
+    """Визуальный прогресс-бар для лайков, VIP и т.д."""
+    if maximum <= 0:
+        filled = length
+    else:
+        filled = max(0, min(length, int(current / maximum * length)))
+    empty = length - filled
+    return "🟩" * filled + "⬜️" * empty
+
+
+def emoji_line(emoji: str, label: str, value: str) -> str:
+    return f"{emoji} <b>{label}:</b> {value}"
 
 
 async def send_sticker(bot: Bot, user_id: int, key: str) -> None:
@@ -230,6 +325,7 @@ ICEBREAKERS: List[str] = [
 ]
 
 CITY_ALIASES: Dict[str, str] = {
+    # Россия
     "мск": "Москва",
     "москва": "Москва",
     "moscow": "Москва",
@@ -255,26 +351,94 @@ CITY_ALIASES: Dict[str, str] = {
     "рнд": "Ростов-на-Дону",
     "самара": "Самара",
     "челябинск": "Челябинск",
-    "челяба": "Челяба",
+    "челяба": "Челябинск",
     "уфа": "Уфа",
     "воронеж": "Воронеж",
     "врн": "Воронеж",
     "пермь": "Пермь",
     "волгоград": "Волгоград",
     "красноярск": "Красноярск",
+    "омск": "Омск",
+    "ения": "Енисейск",
+    "саратов": "Саратов",
+    "тула": "Тула",
+    "рязань": "Рязань",
+    " vladimir": "Владимир",
+    "владимир": "Владимир",
+    "орёл": "Орёл",
+    "орел": "Орёл",
+    "курск": "Курск",
+    "белгород": "Белгород",
+    "брянск": "Брянск",
+    "смоленск": "Смоленск",
+    "тверь": "Тверь",
+    "ярославль": "Ярославль",
+    "иваново": "Иваново",
+    "кострома": "Кострома",
+    "владивосток": "Владивосток",
+    "хабаровск": "Хабаровск",
+    "сочи": "Сочи",
+    "ялта": "Ялта",
+    "севастополь": "Севастополь",
+    "розы": "Ростов-на-Дону",
+    # СНГ
     "минск": "Минск",
     "алматы": "Алматы",
     "астана": "Астана",
+    "бишкек": "Бишкек",
+    "ташкент": "Ташкент",
+    "киев": "Киев",
+    "харьков": "Харьков",
+    "одесса": "Одесса",
 }
 
 
+COUNTRY_ALIASES: Dict[str, str] = {
+    "россия": "Россия",
+    "rf": "Россия",
+    "russia": "Россия",
+    "росси": "Россия",
+    "беларусь": "Беларусь",
+    "belarus": "Беларусь",
+    "by": "Беларусь",
+    "кз": "Казахстан",
+    "казахстан": "Казахстан",
+    "kazakhstan": "Казахстан",
+    "украина": "Украина",
+    "ukraine": "Украина",
+    "ua": "Украина",
+}
+
+RUSSIAN_CITIES: List[str] = [
+    "Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск", "Казань",
+    "Нижний Новгород", "Челябинск", "Самара", "Омск", "Ростов-на-Дону",
+    "Уфа", "Красноярск", "Пермь", "Волгоград", "Краснодар", "Владивосток",
+    "Хабаровск", "Сочи", "Ярославль", "Иваново", "Владимир",
+    "Тула", "Рязань", "Тверь", "Кострома", "Орёл", "Курск", "Белгород",
+    "Брянск", "Смоленск", "Самара", "Саратов", "Ульяновск", "Пенза",
+    "Тамбов", "Липецк", "Воронеж", "Курган", "Тюмень", "Сургут",
+    "Новороссийск", "Архангельск", "Мурманск", "Псков", "Великий Новгород",
+    "Череповец", "Вологда", "Йошкар-Ола", "Саранск", "Чебоксары",
+    "Ижевск", "Пермь", "Оренбург", "Нижневартовск", "Набережные Челны",
+]
+
+
 def normalize_city(raw_city: str) -> str:
-    """Приводит популярные сокращения городов к единому стандарту."""
+    """Приводитpopularные сокращения городов к единому стандарту."""
     cleaned = " ".join(raw_city.strip().split())
     low = cleaned.lower()
     if low in CITY_ALIASES:
         return CITY_ALIASES[low]
     return cleaned[:1].upper() + cleaned[1:] if cleaned else "Не указан"
+
+
+def normalize_country(raw_country: str) -> str:
+    """Нормализует название страны."""
+    cleaned = " ".join(raw_country.strip().split())
+    low = cleaned.lower()
+    if low in COUNTRY_ALIASES:
+        return COUNTRY_ALIASES[low]
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else "Россия"
 
 
 def format_gender_label(gender: str) -> str:
@@ -348,35 +512,91 @@ class Product:
 
 
 PRODUCTS: Dict[str, Product] = {
+    # VIP подписки
+    "vip_3": Product(
+        key="vip_3",
+        title="👑 VIP на 3 дня (Пробный)",
+        description="• Просмотр всех, кто лайкнул\n• Безлимитные лайки\n• +2 💌 Супер-письма\n• Значок VIP в анкете",
+        base_price_rub=149,
+    ),
     "vip_7": Product(
         key="vip_7",
-        title="👑 VIP-статус на 7 дней",
-        description="• Просмотр всех, кто тебя лайкнул\n• Безлимитные лайки\n• +3 💌 Супер-письма в подарок\n• Значок 👑 VIP в анкете",
-        base_price_rub=290,
+        title="👑 VIP на 7 дней",
+        description="• Просмотр всех, кто лайкнул\n• Безлимитные лайки\n• +3 💌 Супер-письма\n• Значок VIP в анкете\n• Приоритет в поиске",
+        base_price_rub=299,
     ),
     "vip_30": Product(
         key="vip_30",
-        title="👑 VIP-статус на 30 дней (ХИТ)",
-        description="• Все привилегии VIP на целый месяц\n• +10 💌 Супер-писем в подарок\n• Максимальный приоритет показа",
-        base_price_rub=690,
+        title="👑 VIP на 30 дней (ХИТ)",
+        description="• Все привилегии VIP на месяц\n• +10 💌 Супер-писем\n• Максимальный приоритет показа\n• Значок VIP\n• Безлимитные лайки",
+        base_price_rub=799,
+    ),
+    "vip_90": Product(
+        key="vip_90",
+        title="👑 VIP на 90 дней (МАКСИМУМ)",
+        description="• Все привилегии на 3 месяца\n• +25 💌 Супер-писем\n• Максимальный приоритет\n• Скрытый режим просмотра\n• Экономия 25%",
+        base_price_rub=1999,
+    ),
+    # Покупка функций по отдельности
+    "likes_unlimited": Product(
+        key="likes_unlimited",
+        title="❤️ Безлимитные лайки на 7 дней",
+        description="• Ставь лайки без ограничений неделю\n• Идеально для активного поиска",
+        base_price_rub=199,
+    ),
+    "likes_pack_50": Product(
+        key="likes_pack_50",
+        title="❤️ Пакет 50 дополнительных лайков",
+        description="• +50 лайков сверх дневного лимита\n• Не сгорают, используй когда нужно",
+        base_price_rub=99,
     ),
     "boost_24": Product(
         key="boost_24",
-        title="🚀 Поднятие в ТОП на 24 часа",
-        description="• Твоя анкета показывается первой всем пользователям твоего возраста 24 часа",
-        base_price_rub=149,
+        title="🚀 Буст в ТОП на 24 часа",
+        description="• Твоя анкета показывается первой всем пользователям\n• +300% больше просмотров\n• 24 часа максимальной видимости",
+        base_price_rub=249,
+    ),
+    "boost_72": Product(
+        key="boost_72",
+        title="🚀 Буст в ТОП на 72 часа",
+        description="• Твоя анкета в ТОП 3 дня\n• +500% больше просмотров\n• Максимальная активность",
+        base_price_rub=599,
+    ),
+    "super_1": Product(
+        key="super_1",
+        title="💌 1 Супер-письмо",
+        description="• Напиши любому человеку сразу без мэтча\n• Мгновенная доставка с кнопкой ответа",
+        base_price_rub=49,
     ),
     "super_5": Product(
         key="super_5",
-        title="💌 Пакет: 5 Супер-писем",
-        description="• Напиши личное сообщение любому человеку сразу, не дожидаясь взаимного лайка!",
+        title="💌 Пакет 5 Супер-писем",
+        description="• 5 сообщений любому человеку без мэтча\n• Выгода 18%",
         base_price_rub=199,
+    ),
+    "super_15": Product(
+        key="super_15",
+        title="💌 Пакет 15 Супер-писем",
+        description="• 15 сообщений любому человеку без мэтча\n• Выгода 40%",
+        base_price_rub=449,
     ),
     "reset_skips": Product(
         key="reset_skips",
         title="🔄 Сброс пропущенных анкет",
-        description="• Очистить историю «Дальше 👎» и снова увидеть всех пропущенных пользователей",
-        base_price_rub=99,
+        description="• Очисти историю «Дальше 👎»\n• Снова увидь всех пропущенных пользователей",
+        base_price_rub=129,
+    ),
+    "see_likes": Product(
+        key="see_likes",
+        title="👀 Посмотреть, кто лайкнул (3 дня)",
+        description="• Доступ к списку входящих лайков\n• Прямой просмотр без VIP\n• 3 дня доступа",
+        base_price_rub=149,
+    ),
+    "anonymous_view": Product(
+        key="anonymous_view",
+        title="👤 Анонимный просмотр на 7 дней",
+        description="• Сматривай анкеты без следа\n• Пользователи не увидят, что ты заходил\n• Полная приватность",
+        base_price_rub=179,
     ),
 }
 
@@ -514,7 +734,8 @@ class Database:
                     ref_count INTEGER NOT NULL DEFAULT 0,
                     last_active INTEGER NOT NULL DEFAULT 0,
                     last_daily_bonus INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    country TEXT NOT NULL DEFAULT 'Россия'
                 )
                 """
             )
@@ -627,6 +848,7 @@ class Database:
             ("ref_count", "ALTER TABLE profiles ADD COLUMN ref_count INTEGER NOT NULL DEFAULT 0"),
             ("last_active", "ALTER TABLE profiles ADD COLUMN last_active INTEGER NOT NULL DEFAULT 0"),
             ("last_daily_bonus", "ALTER TABLE profiles ADD COLUMN last_daily_bonus INTEGER NOT NULL DEFAULT 0"),
+            ("country", "ALTER TABLE profiles ADD COLUMN country TEXT NOT NULL DEFAULT 'Россия'"),
         ]
         for col_name, sql in migrations:
             if col_name not in p_cols:
@@ -822,9 +1044,11 @@ class Database:
         interests: str,
         photo_id: Optional[str],
         media_type: str = "photo",
+        country: str = "Россия",
     ) -> bool:
         now = int(time.time())
         norm_city = normalize_city(city)
+        norm_country = normalize_country(country)
         if age < 18:
             min_a, max_a = 14, 17
         else:
@@ -839,7 +1063,7 @@ class Database:
                     UPDATE profiles
                     SET username = ?, name = ?, gender = ?, looking_for = ?, age = ?,
                         min_pref_age = ?, max_pref_age = ?, city = ?, bio = ?, interests = ?,
-                        photo_id = ?, media_type = ?, active = 1, last_active = ?
+                        photo_id = ?, media_type = ?, active = 1, last_active = ?, country = ?
                     WHERE user_id = ?
                     """,
                     (
@@ -856,6 +1080,7 @@ class Database:
                         photo_id,
                         media_type,
                         now,
+                        norm_country,
                         user_id,
                     ),
                 )
@@ -866,9 +1091,9 @@ class Database:
                     INSERT INTO profiles (
                         user_id, username, name, gender, looking_for, age, min_pref_age, max_pref_age,
                         city, bio, interests, photo_id, media_type, verified, banned,
-                        active, boost_until, vip_until, superlikes, referred_by, ref_count, last_active, created_at
+                        active, boost_until, vip_until, superlikes, referred_by, ref_count, last_active, created_at, country
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, 0, 0, 1, 0, 0, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, 0, 0, 1, 0, 0, ?, ?, ?)
                     """,
                     (
                         user_id,
@@ -886,6 +1111,7 @@ class Database:
                         media_type,
                         now,
                         now,
+                        norm_country,
                     ),
                 )
                 return True
@@ -905,6 +1131,11 @@ class Database:
         norm_city = normalize_city(city)
         with self._session() as conn:
             conn.execute("UPDATE profiles SET city = ? WHERE user_id = ?", (norm_city, user_id))
+
+    def update_country(self, user_id: int, country: str) -> None:
+        norm_country = normalize_country(country)
+        with self._session() as conn:
+            conn.execute("UPDATE profiles SET country = ? WHERE user_id = ?", (norm_country, user_id))
 
     def update_preferences(self, user_id: int, gender: str, looking_for: str) -> None:
         with self._session() as conn:
@@ -1117,6 +1348,7 @@ class Database:
 
         now = int(time.time())
         my_city = str(me["city"]).strip().lower()
+        my_country = str(me["country"] or "Россия").strip().lower()
         my_age = int(me["age"])
         my_gender = str(me["gender"] or "M")
         my_looking = str(me["looking_for"] or "A")
@@ -1140,6 +1372,8 @@ class Database:
                   AND p.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)
                   AND p.user_id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?)
             """
+            # Ищем в той же стране
+            country_clause = " AND LOWER(TRIM(p.country)) = ? "
             order_clause = """
                 ORDER BY (CASE WHEN p.boost_until > ? THEN 1 ELSE 0 END) DESC,
                          (CASE WHEN p.vip_until > ? THEN 1 ELSE 0 END) DESC,
@@ -1150,7 +1384,7 @@ class Database:
             """
             recent_cutoff = now - 3600 * 12
 
-            # 1. Ищем в том же городе по предпочтительному возрасту
+            # 1. Ищем в том же городе и стране
             if city_prioritized:
                 params_pref_city = [
                     user_id,
@@ -1162,18 +1396,61 @@ class Database:
                     user_id,
                     user_id,
                     user_id,
+                    my_country,
                     my_city,
                     now,
                     now,
                     recent_cutoff,
                 ]
-                q1 = base_query + " AND LOWER(TRIM(p.city)) = ? " + order_clause
+                q1 = base_query + country_clause + " AND LOWER(TRIM(p.city)) = ? " + order_clause
                 row = conn.execute(q1, params_pref_city).fetchone()
                 if row:
                     return row
 
-            # 2. Ищем в любом городе по предпочтительному возрасту
-            params_pref_any = [
+            # 2. Ищем в любой город той же страны
+            params_pref_country = [
+                user_id,
+                pref_min,
+                pref_max,
+                my_looking,
+                my_looking,
+                my_gender,
+                user_id,
+                user_id,
+                user_id,
+                my_country,
+                now,
+                now,
+                recent_cutoff,
+            ]
+            q2 = base_query + country_clause + order_clause
+            row = conn.execute(q2, params_pref_country).fetchone()
+            if row:
+                return row
+
+            # 3. Если по узкому фильтру возраста никого не осталось в стране — ищем по всей допустимой категории в стране
+            params_fallback = [
+                user_id,
+                hard_min,
+                hard_max,
+                my_looking,
+                my_looking,
+                my_gender,
+                user_id,
+                user_id,
+                user_id,
+                my_country,
+                now,
+                now,
+                recent_cutoff,
+            ]
+            q3 = base_query + country_clause + order_clause
+            row = conn.execute(q3, params_fallback).fetchone()
+            if row:
+                return row
+
+            # 4. Если в стране никого нет — ищем глобально (все страны)
+            params_global = [
                 user_id,
                 pref_min,
                 pref_max,
@@ -1187,12 +1464,12 @@ class Database:
                 now,
                 recent_cutoff,
             ]
-            row = conn.execute(base_query + order_clause, params_pref_any).fetchone()
+            row = conn.execute(base_query + order_clause, params_global).fetchone()
             if row:
                 return row
 
-            # 3. Если по узкому фильтру возраста никого не осталось — ищем по всей допустимой категории (18+ или <18)
-            params_fallback = [
+            # 5. Глобальный fallback по широкому возрасту
+            params_global_fallback = [
                 user_id,
                 hard_min,
                 hard_max,
@@ -1206,7 +1483,7 @@ class Database:
                 now,
                 recent_cutoff,
             ]
-            return conn.execute(base_query + order_clause, params_fallback).fetchone()
+            return conn.execute(base_query + order_clause, params_global_fallback).fetchone()
 
     def create_order(
         self, order_id: str, user_id: int, product: str, base_amount: int, commission: int, total_amount: int
@@ -1539,23 +1816,41 @@ def kb_candidate(target_id: int, show_supermsg: bool = True) -> InlineKeyboardMa
 
 def kb_shop_menu() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    # Статусы
-    rows.append([InlineKeyboardButton(text="👑 VIP-статус", callback_data="shop:cat:vip")])
-    for key in ("vip_7", "vip_30"):
+
+    # Вип подписки
+    rows.append([InlineKeyboardButton(text="👑 VIP ПОДПИСКИ", callback_data="shop:cat:vip")])
+    for key in ("vip_3", "vip_7", "vip_30", "vip_90"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
-    # Продвижение
-    rows.append([InlineKeyboardButton(text="🚀 Продвижение анкеты", callback_data="shop:cat:boost")])
-    for key in ("boost_24", "reset_skips"):
+    # Лайки
+    rows.append([InlineKeyboardButton(text="❤️ ЛАЙКИ", callback_data="shop:cat:likes")])
+    for key in ("likes_unlimited", "likes_pack_50"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
         rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
-    # Сообщения
-    rows.append([InlineKeyboardButton(text="💌 Супер-письма", callback_data="shop:cat:msg")])
-    rows.append([InlineKeyboardButton(text=f"  {PRODUCTS['super_5'].title} — {calc_price_with_commission(PRODUCTS['super_5'].base_price_rub)[2]} ₽", callback_data="shop:buy:super_5")])
+    # Бусты
+    rows.append([InlineKeyboardButton(text="🚀 БУСТЫ И ПРОДВИЖЕНИЕ", callback_data="shop:cat:boost")])
+    for key in ("boost_24", "boost_72"):
+        prod = PRODUCTS[key]
+        _, _, total = calc_price_with_commission(prod.base_price_rub)
+        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+
+    # Супер письма
+    rows.append([InlineKeyboardButton(text="💌 СУПЕР-ПИСЬМА", callback_data="shop:cat:msg")])
+    for key in ("super_1", "super_5", "super_15"):
+        prod = PRODUCTS[key]
+        _, _, total = calc_price_with_commission(prod.base_price_rub)
+        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+
+    # Дополнительно
+    rows.append([InlineKeyboardButton(text="🔧 ДОПОЛНИТЕЛЬНО", callback_data="shop:cat:extra")])
+    for key in ("reset_skips", "see_likes", "anonymous_view"):
+        prod = PRODUCTS[key]
+        _, _, total = calc_price_with_commission(prod.base_price_rub)
+        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
 
     rows.append([InlineKeyboardButton(text="🎁 Получить VIP бесплатно (за друзей)", callback_data="ref:menu")])
     rows.append(
@@ -1644,7 +1939,7 @@ def format_profile_card(
     info_lines = [
         stat_row("👤", "Имя", f"{esc(p['name'])}, {int(p['age'])} лет", highlight=True),
         stat_row("🚻", "Пол", gender_str),
-        stat_row("📍", "Город", f"{esc(p['city'])}  •  {online_str}"),
+        stat_row("🌍", "Страна / Город", f"{esc(str(p['country'] or 'Россия'))} / {esc(p['city'])}  •  {online_str}"),
     ]
     if show_prefs:
         age_range_str = f"{p['min_pref_age']}–{p['max_pref_age']} лет"
@@ -2242,30 +2537,62 @@ async def ask_step_age(bot: Bot, user_id: int, state: FSMContext) -> None:
     )
 
 
+async def ask_step_country(bot: Bot, user_id: int, state: FSMContext) -> None:
+    await state.set_state(ProfileForm.city)  # переиспользуем состояние для страны, но пометим в data
+    await state.update_data(choosing_country=True)
+    quick_countries = [
+        [
+            InlineKeyboardButton(text="🇷🇺 Россия", callback_data="form:country:Россия"),
+            InlineKeyboardButton(text="🇧🇾 Беларусь", callback_data="form:country:Беларусь"),
+        ],
+        [
+            InlineKeyboardButton(text="🇰🇿 Казахстан", callback_data="form:country:Казахстан"),
+            InlineKeyboardButton(text="🇺🇦 Украина", callback_data="form:country:Украина"),
+        ],
+        [InlineKeyboardButton(text="🌍 Другая страна", callback_data="form:country:other")],
+    ]
+    bar = progress_bar(4, 8, length=8)
+    await send_screen(
+        bot,
+        user_id,
+        f"{screen_header('Создание анкеты', 'Шаг 5 из 8 — Страна')}\n"
+        f"{bar}\n\n"
+        f"Выбери свою страну или напиши название в чат:",
+        reply_markup=kb_form_nav(back_step="age", extra_rows=quick_countries),
+    )
+
+
 async def ask_step_city(bot: Bot, user_id: int, state: FSMContext) -> None:
     await state.set_state(ProfileForm.city)
-    quick_cities = [
-        [
-            InlineKeyboardButton(text="📍 Москва", callback_data="form:city:Москва"),
-            InlineKeyboardButton(text="📍 Санкт-Петербург", callback_data="form:city:Санкт-Петербург"),
-        ],
-        [
-            InlineKeyboardButton(text="📍 Екатеринбург", callback_data="form:city:Екатеринбург"),
-            InlineKeyboardButton(text="📍 Новосибирск", callback_data="form:city:Новосибирск"),
-        ],
-        [
-            InlineKeyboardButton(text="📍 Краснодар", callback_data="form:city:Краснодар"),
-            InlineKeyboardButton(text="📍 Казань", callback_data="form:city:Казань"),
-        ],
-    ]
+    await state.update_data(choosing_country=False)
+    data = await state.get_data()
+    selected_country = data.get("country", "Россия")
+    
+    # Показываем города выбранной страны (для России — большой список, для других — ручной ввод)
+    if selected_country == "Россия":
+        quick_cities = []
+        chunk = RUSSIAN_CITIES[:12]
+        for i in range(0, len(chunk), 2):
+            row = []
+            row.append(InlineKeyboardButton(text=f"📍 {chunk[i]}", callback_data=f"form:city:{chunk[i]}"))
+            if i + 1 < len(chunk):
+                row.append(InlineKeyboardButton(text=f"📍 {chunk[i+1]}", callback_data=f"form:city:{chunk[i+1]}"))
+            quick_cities.append(row)
+        quick_cities.append([InlineKeyboardButton(text="📝 Написать свой город", callback_data="form:city:manual")])
+    else:
+        quick_cities = [
+            [InlineKeyboardButton(text="📝 Написать свой город", callback_data="form:city:manual")],
+        ]
+
     bar = progress_bar(5, 8, length=8)
     await send_screen(
         bot,
         user_id,
-        f"{screen_header('Создание анкеты', 'Шаг 5 из 8 — Город')}\n"
+        f"{screen_header('Создание анкеты', 'Шаг 6 из 8 — Город')}\n"
         f"{bar}\n\n"
-        f"Из какого ты города? Выбери кнопкой ниже или <b>напиши название своего города</b> в чат:",
-        reply_markup=kb_form_nav(back_step="age", extra_rows=quick_cities),
+        f"Страна: <b>{esc(selected_country)}</b>\n"
+        f"Из какого ты города? Выбери кнопкой или нажми «Написать свой город»:",
+        reply_markup=kb_form_nav(back_step="country", extra_rows=quick_cities),
     )
 
 
@@ -2339,6 +2666,8 @@ async def cb_form_back(call: CallbackQuery, state: FSMContext, bot: Bot) -> None
         await ask_step_looking_for(bot, uid, state)
     elif step == "age":
         await ask_step_age(bot, uid, state)
+    elif step == "country":
+        await ask_step_country(bot, uid, state)
     elif step == "city":
         await ask_step_city(bot, uid, state)
     elif step == "interests":
@@ -2395,6 +2724,54 @@ async def form_age(message: Message, state: FSMContext, bot: Bot) -> None:
     await ask_step_city(bot, message.from_user.id, state)
 
 
+@router.callback_query(F.data.startswith("form:country:"))
+async def form_country_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    country = call.data.split(":", 2)[2]
+    if country == "other":
+        await state.update_data(choosing_country=True, country="")
+        await send_screen(
+            bot,
+            call.from_user.id,
+            f"{screen_header('Создание анкеты', 'Шаг 5 из 8 — Страна')}\n"
+            f"{progress_bar(4, 8, length=8)}\n\n"
+            f"Напиши название своей страны в чат:",
+            reply_markup=kb_form_nav(back_step="age"),
+        )
+        return
+    await state.update_data(choosing_country=False, country=country)
+    await ask_step_city(bot, call.from_user.id, state)
+
+
+@router.message(ProfileForm.city, F.text.startswith("/"))
+async def form_city_ignore_commands(message: Message, state: FSMContext, bot: Bot) -> None:
+    pass
+
+
+@router.callback_query(ProfileForm.city, F.data == "form:city:manual")
+async def form_city_manual_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    data = await state.get_data()
+    if data.get("choosing_country"):
+        await send_screen(
+            bot,
+            call.from_user.id,
+            f"{screen_header('Создание анкеты', 'Шаг 5 из 8 — Страна')}\n"
+            f"{progress_bar(4, 8, length=8)}\n\n"
+            f"Напиши название своей страны в чат:",
+            reply_markup=kb_form_nav(back_step="age"),
+        )
+    else:
+        await send_screen(
+            bot,
+            call.from_user.id,
+            f"{screen_header('Создание анкеты', 'Шаг 6 из 8 — Город')}\n"
+            f"{progress_bar(5, 8, length=8)}\n\n"
+            f"Напиши название своего города в чат:",
+            reply_markup=kb_form_nav(back_step="country"),
+        )
+
+
 @router.callback_query(ProfileForm.city, F.data.startswith("form:city:"))
 async def form_city_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
@@ -2406,13 +2783,28 @@ async def form_city_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None
 @router.message(ProfileForm.city)
 async def form_city(message: Message, state: FSMContext, bot: Bot) -> None:
     await delete_user_msg(message)
+    data = await state.get_data()
+    if data.get("choosing_country"):
+        raw_country = (message.text or "").strip()
+        if len(raw_country) < 2 or len(raw_country) > 40:
+            await send_screen(
+                bot,
+                message.from_user.id,
+                "⚠️ <b>Название страны должно быть от 2 до 40 символов.</b>",
+                reply_markup=kb_form_nav(back_step="age"),
+            )
+            return
+        await state.update_data(choosing_country=False, country=normalize_country(raw_country))
+        await ask_step_city(bot, message.from_user.id, state)
+        return
+
     raw_city = (message.text or "").strip()
     if not Database.validate_city(raw_city):
         await send_screen(
             bot,
             message.from_user.id,
             "⚠️ <b>Название города должно быть от 2 до 40 символов и содержать только буквы, пробелы, дефис или апостроф:</b>",
-            reply_markup=kb_form_nav(back_step="age"),
+            reply_markup=kb_form_nav(back_step="country"),
         )
         return
     await state.update_data(city=normalize_city(raw_city))
@@ -2480,6 +2872,7 @@ async def finalize_profile_creation(
         interests=str(data.get("interests", "")),
         photo_id=photo_id,
         media_type=media_type,
+        country=str(data.get("country", "Россия")),
     )
 
     if is_new:
@@ -3045,6 +3438,7 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
 
             await call.answer("Лайк отправлен ❤️")
             await send_sticker(bot, user_id, "like")
+            await hearts_animation(bot, user_id, count=3)
             await show_next_candidate(bot, db, user_id)
 
 
@@ -3607,21 +4001,49 @@ async def complete_and_reward_order(bot: Bot, db: Database, order: sqlite3.Row, 
     prod_key = str(order["product"])
     db.mark_order_paid(str(order["order_id"]), charge_source)
 
-    if prod_key == "vip_7":
+    if prod_key == "vip_3":
+        db.add_vip(uid, days=3, bonus_superlikes=2)
+        reward_text = "👑 <b>VIP на 3 дня</b> и <b>+2 💌 Супер-письма</b> начислены!"
+    elif prod_key == "vip_7":
         db.add_vip(uid, days=7, bonus_superlikes=3)
-        reward_text = "👑 <b>VIP-статус на 7 дней</b> и <b>+3 💌 Супер-письма</b> успешно начислены!"
+        reward_text = "👑 <b>VIP на 7 дней</b> и <b>+3 💌 Супер-письма</b> начислены!"
     elif prod_key == "vip_30":
         db.add_vip(uid, days=30, bonus_superlikes=10)
-        reward_text = "👑 <b>VIP-статус на 30 дней</b> и <b>+10 💌 Супер-писем</b> успешно начислены!"
+        reward_text = "👑 <b>VIP на 30 дней</b> и <b>+10 💌 Супер-писем</b> начислены!"
+    elif prod_key == "vip_90":
+        db.add_vip(uid, days=90, bonus_superlikes=25)
+        reward_text = "👑 <b>VIP на 90 дней</b> и <b>+25 💌 Супер-писем</b> начислены!"
+    elif prod_key == "likes_unlimited":
+        db.add_vip(uid, days=7, bonus_superlikes=0)
+        reward_text = "❤️ <b>Безлимитные лайки на 7 дней</b> активированы!"
+    elif prod_key == "likes_pack_50":
+        # Добавляем 50 лайков через супер-письма как счетчик (или просто супер-письма)
+        db.add_superlikes(uid, count=50)
+        reward_text = "❤️ <b>+50 лайков</b> добавлены на твой баланс!"
     elif prod_key == "boost_24":
         db.add_boost(uid, hours=24)
-        reward_text = "🚀 <b>ТОП-продвижение анкеты на 24 часа</b> успешно активировано!"
+        reward_text = "🚀 <b>Буст в ТОП на 24 часа</b> активирован!"
+    elif prod_key == "boost_72":
+        db.add_boost(uid, hours=72)
+        reward_text = "🚀 <b>Буст в ТОП на 72 часа</b> активирован!"
+    elif prod_key == "super_1":
+        db.add_superlikes(uid, count=1)
+        reward_text = "💌 <b>+1 Супер-письмо</b> добавлено!"
     elif prod_key == "super_5":
         db.add_superlikes(uid, count=5)
-        reward_text = "💌 <b>+5 Супер-писем</b> добавлены на твой баланс!"
+        reward_text = "💌 <b>+5 Супер-писем</b> добавлено!"
+    elif prod_key == "super_15":
+        db.add_superlikes(uid, count=15)
+        reward_text = "💌 <b>+15 Супер-писем</b> добавлено!"
     elif prod_key == "reset_skips":
         cnt = db.reset_user_skips(uid)
         reward_text = f"🔄 <b>История пропусков очищена</b> (восстановлено анкет: {cnt})!"
+    elif prod_key == "see_likes":
+        db.add_vip(uid, days=3, bonus_superlikes=0)
+        reward_text = "👀 <b>Доступ к входящим лайкам на 3 дня</b> активирован!"
+    elif prod_key == "anonymous_view":
+        db.add_vip(uid, days=7, bonus_superlikes=0)
+        reward_text = "👤 <b>Анонимный просмотр на 7 дней</b> активирован!"
     else:
         reward_text = "✅ <b>Услуга успешно активирована!</b>"
 
