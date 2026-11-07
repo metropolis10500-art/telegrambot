@@ -1915,24 +1915,28 @@ async def cb_ref_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
     bar = "🟩" * progress + "⬜️" * (3 - progress)
     left_for_vip = 3 - progress
 
+    friend_box = screen_box("💎 Твой друг получит", [
+        stat_row("💌", "Супер-писем", "2 шт. при регистрации (вместо 1)"),
+    ])
+    rewards_box = screen_box("🔥 Твои награды", [
+        stat_row("1️⃣", "Регистрация друга", "+1 💌 Супер-письмо + 6 часов 🚀 ТОП-продвижения"),
+        stat_row("2️⃣", "За каждых 3-х друзей", "👑 VIP на 24 часа + бонусное Супер-письмо"),
+        stat_row("3️⃣", "Покупка другом товара", "+24 часа VIP и +2 💌 Супер-письма"),
+    ])
+    stats_box = screen_box("📊 Твоя статистика", [
+        stat_row("👥", "Приглашено", f"{ref_count} чел.", highlight=True),
+        stat_row("👑", "До следующего VIP", f"[{bar}] — осталось {left_for_vip} др."),
+    ])
+    link_box = screen_box("🔗 Твоя ссылка", [
+        stat_row("📋", "Ссылка", f"<code>{ref_link}</code>"),
+    ])
     text = (
         f"{screen_header('Партнёрская программа', 'Приглашай друзей и получай привилегии')}\n"
         "Приглашай друзей по своей личной ссылке и получай платные привилегии <b>абсолютно бесплатно</b>!\n\n"
-        f"{screen_box('💎 Твой друг получит', [
-            stat_row("💌", "Супер-писем", "2 шт. при регистрации (вместо 1)"),
-        ])}\n\n"
-        f"{screen_box('🔥 Твои награды', [
-            stat_row("1️⃣", "Регистрация друга", "+1 💌 Супер-письмо + 6 часов 🚀 ТОП-продвижения"),
-            stat_row("2️⃣", "За каждых 3-х друзей", "👑 VIP на 24 часа + бонусное Супер-письмо"),
-            stat_row("3️⃣", "Покупка другом товара", "+24 часа VIP и +2 💌 Супер-письма"),
-        ])}\n\n"
-        f"{screen_box('📊 Твоя статистика', [
-            stat_row("👥", "Приглашено", f"{ref_count} чел.", highlight=True),
-            stat_row("👑", "До следующего VIP", f"[{bar}] — осталось {left_for_vip} др."),
-        ])}\n\n"
-        f"{screen_box('🔗 Твоя ссылка', [
-            stat_row("📋", "Ссылка", f"<code>{ref_link}</code>"),
-        ])}"
+        f"{friend_box}\n\n"
+        f"{rewards_box}\n\n"
+        f"{stats_box}\n\n"
+        f"{link_box}"
     )
 
     kb = InlineKeyboardMarkup(
@@ -1985,9 +1989,10 @@ async def render_reviews_screen(bot: Bot, db: Database, user_id: int, offset: in
     )
 
     if not reviews:
-        body = f"\n{screen_box('Пока нет отзывов', [
+        no_reviews_box = screen_box("Пока нет отзывов", [
             stat_row("✨", "Будь первым!", "Оставь отзыв и получи +1 💌 Супер-письмо"),
-        ])}"
+        ])
+        body = f"\n{no_reviews_box}"
     else:
         blocks: List[str] = []
         for r in reviews:
@@ -2968,30 +2973,39 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
             )
             compat_score, _ = calc_compatibility(me, target)
 
+            match_box_target = screen_box("💬 Что дальше?", [
+                stat_row("🎲", "Ледокол", "Отправь случайный вопрос для старта"),
+                stat_row("✍️", "Сообщение", "Напиши своё через бота"),
+            ])
+
             try:
                 await bot.send_message(
                     target_id,
                     f"{celebration_line('💞 У тебя взаимный Мэтч!')}\n"
                     f"{random_divider()}\n"
-                    f"Ты и <b>{esc(me['name'])}</b> ({me['age']}, {esc(me['city'])}) понравились друг другу!\n"
-                    f"🔥 Ваша совместимость: <b>{compat_score}%</b>\n"
-                    f"🔗 Контакт в Telegram: {my_link}\n\n"
-                    f"{screen_box('💬 Что дальше?', [
-                        stat_row("🎲", "Ледокол", "Отправь случайный вопрос для старта"),
-                        stat_row("✍️", "Сообщение", "Напиши своё через бота"),
-                    ])}",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text=f"💬 Написать {me['name']}", callback_data=f"chat:write:{user_id}")],
-                            [InlineKeyboardButton(text="🎲 Отправить Ледокол (Идея для старта)", callback_data=f"chat:ice:{user_id}")],
-                            [InlineKeyboardButton(text="🔥 Продолжить поиск", callback_data="browse:next")],
-                        ]
-                    ),
+                f"Ты и <b>{esc(me['name'])}</b> ({me['age']}, {esc(me['city'])}) понравились друг другу!\n"
+                f"🔥 Ваша совместимость: <b>{compat_score}%</b>\n"
+                f"🔗 Контакт в Telegram: {my_link}\n\n"
+                f"{match_box_target}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text=f"💬 Написать {me['name']}", callback_data=f"chat:write:{user_id}")],
+                        [InlineKeyboardButton(text="🎲 Отправить Ледокол (Идея для старта)", callback_data=f"chat:ice:{user_id}")],
+                        [InlineKeyboardButton(text="🔥 Продолжить поиск", callback_data="browse:next")],
+                    ]
+                ),
                 )
             except Exception:
                 pass
 
             await call.answer("Взаимная симпатия! 💞")
+
+            match_box_user = screen_box("💬 Что дальше?", [
+                stat_row("🎲", "Ледокол", "Отправь случайный вопрос для старта"),
+                stat_row("✍️", "Сообщение", "Напиши своё через бота"),
+                stat_row("🔥", "Поиск", "Продолжи смотреть анкеты"),
+            ])
+
             await send_screen(
                 bot,
                 user_id,
@@ -3000,11 +3014,7 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
                 f"Ты понравился(ась) <b>{esc(target['name'])}</b> ({target['age']}, {esc(target['city'])})!\n"
                 f"🔥 Ваша совместимость: <b>{compat_score}%</b>\n"
                 f"🔗 Контакт в Telegram: {target_link}\n\n"
-                f"{screen_box('💬 Что дальше?', [
-                    stat_row("🎲", "Ледокол", "Отправь случайный вопрос для старта"),
-                    stat_row("✍️", "Сообщение", "Напиши своё через бота"),
-                    stat_row("🔥", "Поиск", "Продолжи смотреть анкеты"),
-                ])}",
+                f"{match_box_user}",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
                         [InlineKeyboardButton(text=f"💬 Написать {target['name']} через бота", callback_data=f"chat:write:{target_id}")],
@@ -3341,14 +3351,15 @@ async def cb_super_ask(call: CallbackQuery, state: FSMContext, db: Database, bot
             ]
         ]
     )
+    super_msg_box = screen_box("📝 Инструкция", [
+        stat_row("✍️", "Сообщение", "Напиши текст, который доставим адресату"),
+        stat_row("🚀", "Доставка", "Мгновенно, без ожидания взаимного лайка"),
+    ])
     await send_screen(
         bot,
         uid,
         f"{screen_header('Супер-письмо', f'Доступно: {me["superlikes"]} шт.')}\n"
-        f"{screen_box('📝 Инструкция', [
-            stat_row("✍️", "Сообщение", "Напиши текст, который доставим адресату"),
-            stat_row("🚀", "Доставка", "Мгновенно, без ожидания взаимного лайка"),
-        ])}\n\n"
+        f"{super_msg_box}\n\n"
         f"Отправь сообщение в чат:",
         reply_markup=kb,
     )
@@ -3536,17 +3547,18 @@ async def cb_settings_open(call: CallbackQuery, state: FSMContext, db: Database,
     gender_str = format_gender_label(str(p["gender"] or "M"))
     looking_str = format_looking_for_label(str(p["looking_for"] or "A"))
 
+    settings_box = screen_box("📋 Основное", [
+        stat_row("📡", "Статус", status_str, highlight=True),
+        stat_row("🚻", "Твой пол", gender_str),
+        stat_row("🔍", "Кого ищешь", f"{looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)"),
+        stat_row("📍", "Город", esc(p['city'])),
+        stat_row("🎯", "Интересы", format_interests_list(str(p['interests'] or ''))),
+    ])
     await send_screen(
         bot,
         uid,
         f"{screen_header('Настройки анкеты', 'Фильтры и параметры')}\n"
-        f"{screen_box('📋 Основное', [
-            stat_row("📡", "Статус", status_str, highlight=True),
-            stat_row("🚻", "Твой пол", gender_str),
-            stat_row("🔍", "Кого ищешь", f"{looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)"),
-            stat_row("📍", "Город", esc(p['city'])),
-            stat_row("🎯", "Интересы", format_interests_list(str(p['interests'] or ''))),
-        ])}\n\n"
+        f"{settings_box}\n\n"
         f"👇 <i>Выбери, что хочешь настроить:</i>",
         reply_markup=kb_settings(active, is_verified, is_adult),
     )
@@ -3569,17 +3581,18 @@ async def cb_settings_toggle(call: CallbackQuery, db: Database, bot: Bot) -> Non
     gender_str = format_gender_label(str(p["gender"] or "M"))
     looking_str = format_looking_for_label(str(p["looking_for"] or "A"))
 
+    settings_box = screen_box("📋 Основное", [
+        stat_row("📡", "Статус", status_str, highlight=True),
+        stat_row("🚻", "Твой пол", gender_str),
+        stat_row("🔍", "Кого ищешь", f"{looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)"),
+        stat_row("📍", "Город", esc(p['city'])),
+        stat_row("🎯", "Интересы", format_interests_list(str(p['interests'] or ''))),
+    ])
     await send_screen(
         bot,
         uid,
         f"{screen_header('Настройки анкеты', 'Фильтры и параметры')}\n"
-        f"{screen_box('📋 Основное', [
-            stat_row("📡", "Статус", status_str, highlight=True),
-            stat_row("🚻", "Твой пол", gender_str),
-            stat_row("🔍", "Кого ищешь", f"{looking_str} ({p['min_pref_age']}–{p['max_pref_age']} лет)"),
-            stat_row("📍", "Город", esc(p['city'])),
-            stat_row("🎯", "Интересы", format_interests_list(str(p['interests'] or ''))),
-        ])}\n\n"
+        f"{settings_box}\n\n"
         f"👇 <i>Выбери, что хочешь настроить:</i>",
         reply_markup=kb_settings(new_active, is_verified, is_adult),
     )
@@ -3634,12 +3647,13 @@ async def cb_shop_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
         return
 
     await call.answer()
+    payment_box = screen_box("💳 Способ оплаты", [
+        stat_row("🏦", "ЮMoney", "Банковские карты РФ (Mir, Visa, Mastercard)"),
+    ])
     text = (
         f"{screen_header('Магазин привилегий', 'VIP и услуги для анкеты')}\n"
         "Выдели свою анкету среди тысяч других, открой список всех, кто тебя лайкнул, и пиши любому человеку напрямую без ожидания взаимности!\n\n"
-        f"{screen_box('💳 Способ оплаты', [
-            stat_row("🏦", "ЮMoney", "Банковские карты РФ (Mir, Visa, Mastercard)"),
-        ])}\n\n"
+        f"{payment_box}\n\n"
         "👇 <b>Выбери нужную привилегию:</b>"
     )
     await send_screen(bot, uid, text, reply_markup=kb_shop_menu())
@@ -3682,16 +3696,18 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
 
     pay_url = create_yoomoney_pay_link(order_id, total_rub, f"{prod.title} (ID {uid})")
 
+    pay_box = screen_box("💰 К оплате", [
+        stat_row("💵", "Сумма", f"{total_rub} ₽", highlight=True),
+    ])
+    instruction_box = screen_box("📋 Инструкция", [
+        stat_row("1️⃣", "Оплата", "Нажми «💳 Оплатить через ЮMoney» и заверши перевод"),
+        stat_row("2️⃣", "Проверка", "Нажми «🔄 Проверить оплату» — привилегии выдадутся автоматически"),
+    ])
     text = (
         f"{screen_header('Оформление заказа', prod.title)}\n"
         f"{prod.description}\n\n"
-        f"{screen_box('💰 К оплате', [
-            stat_row("💵", "Сумма", f"{total_rub} ₽", highlight=True),
-        ])}\n\n"
-        f"{screen_box('📋 Инструкция', [
-            stat_row("1️⃣", "Оплата", "Нажми «💳 Оплатить через ЮMoney» и заверши перевод"),
-            stat_row("2️⃣", "Проверка", "Нажми «🔄 Проверить оплату» — привилегии выдадутся автоматически"),
-        ])}"
+        f"{pay_box}\n\n"
+        f"{instruction_box}"
     )
 
     kb = InlineKeyboardMarkup(
@@ -3855,15 +3871,17 @@ async def cb_admin_payment_decision(call: CallbackQuery, db: Database, bot: Bot)
 # ПОДДЕРЖКА И СООБЩЕНИЕ ОБ ОШИБКЕ
 # =========================
 async def open_support_screen(bot: Bot, user_id: int) -> None:
+    support_bug_box = screen_box("🛠 Сообщить об ошибке", [
+        stat_row("🐛", "Баг", "Нашли неисправность? Опиши проблему"),
+    ])
+    support_pay_box = screen_box("💳 Оплата и VIP", [
+        stat_row("💳", "Проблема", "Вопрос по оплате или статусу?"),
+    ])
     text = (
         f"{screen_header('Центр поддержки', 'Помощь и обратная связь')}\n"
         f"👨‍💻 <b>Официальная поддержка:</b> <a href='{SUPPORT_URL}'>{SUPPORT_USERNAME}</a>\n\n"
-        f"{screen_box('🛠 Сообщить об ошибке', [
-            stat_row("🐛", "Баг", "Нашли неисправность? Опиши проблему"),
-        ])}\n\n"
-        f"{screen_box('💳 Оплата и VIP', [
-            stat_row("💳", "Проблема", "Вопрос по оплате или статусу?"),
-        ])}"
+        f"{support_bug_box}\n\n"
+        f"{support_pay_box}"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3954,22 +3972,24 @@ async def render_admin_panel(bot: Bot, db: Database, user_id: int) -> None:
         return
     stats = db.get_admin_stats()
     ym_status = "🟢 Подключён (Авто-проверка)" if is_yoomoney_token_configured() else "🟡 Ручной режим (Кнопки в боте)"
+    admin_stats_box = screen_box("📊 Статистика", [
+        stat_row("👥", "Всего анкет", f"{stats['users']} чел.", highlight=True),
+        stat_row("✅", "Верифицировано", f"{stats['verified']} чел."),
+        stat_row("👑", "Активных VIP", f"{stats['vips']} чел."),
+        stat_row("💞", "Мэтчей", f"{stats['matches']} шт."),
+        stat_row("🎁", "Рефералов", f"{stats['refs']} чел."),
+        stat_row("🧾", "Оплаченных заказов", f"{stats['orders']} шт."),
+        stat_row("💰", "Общий оборот", f"{stats['revenue']} ₽"),
+        stat_row("📈", "Комиссия", f"{stats['commission']} ₽ ({COMMISSION_PERCENT}%)"),
+        stat_row("⭐️", "Отзывов", f"{stats['reviews']} шт."),
+    ])
+    admin_pay_box = screen_box("💳 Платежи", [
+        stat_row("🔗", "ЮMoney API", ym_status),
+    ])
     text = (
         f"{screen_header('Панель администратора', 'Управление ботом «Лавчик»')}\n"
-        f"{screen_box('📊 Статистика', [
-            stat_row("👥", "Всего анкет", f"{stats['users']} чел.", highlight=True),
-            stat_row("✅", "Верифицировано", f"{stats['verified']} чел."),
-            stat_row("👑", "Активных VIP", f"{stats['vips']} чел."),
-            stat_row("💞", "Мэтчей", f"{stats['matches']} шт."),
-            stat_row("🎁", "Рефералов", f"{stats['refs']} чел."),
-            stat_row("🧾", "Оплаченных заказов", f"{stats['orders']} шт."),
-            stat_row("💰", "Общий оборот", f"{stats['revenue']} ₽"),
-            stat_row("📈", "Комиссия", f"{stats['commission']} ₽ ({COMMISSION_PERCENT}%)"),
-            stat_row("⭐️", "Отзывов", f"{stats['reviews']} шт."),
-        ])}\n\n"
-        f"{screen_box('💳 Платежи', [
-            stat_row("🔗", "ЮMoney API", ym_status),
-        ])}\n\n"
+        f"{admin_stats_box}\n\n"
+        f"{admin_pay_box}\n\n"
         f"{screen_footer(f'🆘 Поддержка: {SUPPORT_URL}')}"
     )
     kb = InlineKeyboardMarkup(
