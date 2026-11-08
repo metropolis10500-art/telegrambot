@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import html
 import logging
@@ -29,9 +31,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice,
     Message,
-    PreCheckoutQuery,
 )
 from dotenv import load_dotenv
 
@@ -49,13 +49,6 @@ COMMISSION_PERCENT = int(os.getenv("COMMISSION_PERCENT", "30").strip() or 30)
 
 YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET", "410010000000000").strip()
 YOOMONEY_TOKEN = os.getenv("YOOMONEY_TOKEN", "").strip().strip('"').strip("'")
-
-# Telegram Stars (внутренняя оплата Telegram)
-STARS_TOKEN = os.getenv("STARS_TOKEN", "").strip().strip('"').strip("'")
-STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip() == "1"
-
-# Курс: 1 звезда ≈ 1.5 руб (примерно, можно настроить)
-STARS_TO_RUB = float(os.getenv("STARS_TO_RUB", "1.5").strip() or 1.5)
 
 # Ссылки партнёра и технической поддержки
 VELVET_VPN_URL = "https://t.me/velvet?start=3SLkWOoF"
@@ -89,6 +82,11 @@ STICKERS: Dict[str, str] = {
     # Навигация
     "bye": "",            # прощание / отмена
     "back": "",           # возврат назад
+    "celebration": "",    # sucesso / покупка / бонус
+    "gear": "",           # настройки
+    "transition": "",     # переход между экранами
+    "home": "",           # главное меню
+    "message": "",        # новое сообщение
 }
 
 
@@ -109,6 +107,24 @@ async def send_sticker(bot: Bot, user_id: int, key: str) -> None:
         await bot.send_sticker(chat_id=user_id, sticker=sticker_id)
     except Exception:
         pass
+
+
+async def send_transition_sticker(bot: Bot, user_id: int, transition_type: str = "default") -> None:
+    """Отправить стикер анимации при переходе между экранами."""
+    sticker_keys = {
+        "default": "transition",
+        "home": "home",
+        "browse": "dice",
+        "shop": "coins",
+        "settings": "gear",
+        "match": "match",
+        "like": "like",
+        "message": "message",
+        "success": "celebration",
+        "error": "error",
+    }
+    key = sticker_keys.get(transition_type, "transition")
+    await send_sticker(bot, user_id, key)
 
 
 async def dice_animation(bot: Bot, chat_id: int, duration_seconds: float = 1.5) -> str:
@@ -185,23 +201,42 @@ def emoji_line(emoji: str, label: str, value: str) -> str:
 
 
 def screen_header(title: str, subtitle: Optional[str] = None) -> str:
-    """Компактный заголовок экрана."""
-    lines = [f"💎 <b>{esc(title)}</b>"]
+    """Красивый заголовок экрана с эмодзи."""
+    lines = [f"✨ <b>{esc(title)}</b>"]
     if subtitle:
         lines.append(f"<i>{esc(subtitle)}</i>")
     return "\n".join(lines)
 
 
 def screen_box(title: str, lines: List[str]) -> str:
-    """Компактный блок информации."""
+    """Красивый блок информации с рамкой."""
     inner = "\n".join(f"   {line}" for line in lines)
     return f"┌─ <b>{esc(title)}</b>\n{inner}\n└─"
 
 
 def stat_row(emoji: str, label: str, value: str, highlight: bool = False) -> str:
-    """Строка статистики."""
+    """Компактная строка статистики."""
     marker = "🔹" if highlight else "  "
     return f"{marker} {emoji} <b>{label}:</b> {value}"
+
+
+# Эмодзи-разделители для «оживления» текста
+DIVIDERS: List[str] = [
+    "✨━━━━━━━━━━━━━━━━━━━✨",
+    "💫━━━━━━━━━━━━━━━━━━━💫",
+    "🔥━━━━━━━━━━━━━━━━━━━🔥",
+    "💘━━━━━━━━━━━━━━━━━━━💘",
+    "⚡━━━━━━━━━━━━━━━━━━━⚡",
+]
+
+
+def random_divider() -> str:
+    return random.choice(DIVIDERS)
+
+
+def divider_line() -> str:
+    """Единый разделитель секций."""
+    return "━━━━━━━━━━━━━━━━━━━━"
 
 
 def celebration_line(text: str) -> str:
@@ -246,7 +281,7 @@ async def dice_animation(bot: Bot, chat_id: int, duration_seconds: float = 1.5) 
 # Временное хранилище ID последних сообщений бота для чистоты чата
 last_bot_messages: Dict[int, List[int]] = {}
 # Защита от спама уведомлениями админу при проверке оплаты (order_id -> timestamp)
-admin_notified_orders: Dict[str, int] = {}
+pass
 BOT_USERNAME: str = ""
 
 
@@ -588,156 +623,57 @@ def is_yoomoney_token_configured() -> bool:
     return True
 
 
-def is_stars_configured() -> bool:
-    return bool(STARS_TOKEN and len(STARS_TOKEN) > 10 and STARS_ENABLED)
-
-
-def rub_to_stars(rub: int) -> int:
-    """Конвертирует рубли в звёзды Telegram."""
-    return max(1, int(rub / STARS_TO_RUB))
-
-
-async def create_stars_invoice(
-    order_id: str,
-    rub_amount: int,
-    title: str,
-    description: str,
-) -> tuple:
+def check_yoomoney_payment(order_id: str) -> dict:
     """
-    Создаёт счёт для оплаты через Telegram Stars.
-    Возвращает (invoice_payload, stars_amount).
+    Проверяет статус платежа в ЮMoney.
+    Возвращает dict с полями: success (bool), label (str), amount (float), status (str).
     """
-    stars_amount = rub_to_stars(rub_amount)
-    payload = f"stars_{order_id}"
-    prices = [LabeledPrice(label=title, amount=stars_amount)]
-    return payload, stars_amount, prices
-
-
-async def process_stars_payment(
-    bot: Bot,
-    db: Database,
-    user_id: int,
-    order_id: str,
-    prod_key: str,
-    charge_id: str,
-) -> str:
-    """Начисляет привилегии после успешной оплаты звёздами."""
-    order = db.get_order(order_id)
-    if not order:
-        return "❌ Заказ не найден."
-
-    if order["status"] == "paid":
-        return "✅ Заказ уже оплачен."
-
-    db.mark_order_paid(order_id, charge_id)
-
-    if prod_key == "vip_3":
-        db.add_vip(user_id, days=3, bonus_superlikes=2)
-        reward_text = "👑 VIP на 3 дня и +2 💌 Супер-письма начислены!"
-    elif prod_key == "vip_7":
-        db.add_vip(user_id, days=7, bonus_superlikes=3)
-        reward_text = "👑 VIP на 7 дней и +3 💌 Супер-письма начислены!"
-    elif prod_key == "vip_30":
-        db.add_vip(user_id, days=30, bonus_superlikes=10)
-        reward_text = "👑 VIP на 30 дней и +10 💌 Супер-писем начислены!"
-    elif prod_key == "vip_90":
-        db.add_vip(user_id, days=90, bonus_superlikes=25)
-        reward_text = "👑 VIP на 90 дней и +25 💌 Супер-писем начислены!"
-    elif prod_key == "likes_unlimited":
-        db.add_vip(user_id, days=7, bonus_superlikes=0)
-        reward_text = "❤️ Безлимитные лайки на 7 дней активированы!"
-    elif prod_key == "likes_pack_50":
-        db.add_superlikes(user_id, count=50)
-        reward_text = "❤️ +50 лайков добавлено на баланс!"
-    elif prod_key == "boost_24":
-        db.add_boost(user_id, hours=24)
-        reward_text = "🚀 Буст в ТОП на 24 часа активирован!"
-    elif prod_key == "boost_72":
-        db.add_boost(user_id, hours=72)
-        reward_text = "🚀 Буст в ТОП на 72 часа активирован!"
-    elif prod_key == "super_1":
-        db.add_superlikes(user_id, count=1)
-        reward_text = "💌 +1 Супер-письмо добавлено!"
-    elif prod_key == "super_5":
-        db.add_superlikes(user_id, count=5)
-        reward_text = "💌 +5 Супер-писем добавлено!"
-    elif prod_key == "super_15":
-        db.add_superlikes(user_id, count=15)
-        reward_text = "💌 +15 Супер-писем добавлено!"
-    elif prod_key == "reset_skips":
-        cnt = db.reset_user_skips(user_id)
-        reward_text = f"🔄 История пропусков очищена (восстановлено анкет: {cnt})!"
-    elif prod_key == "see_likes":
-        db.add_vip(user_id, days=3, bonus_superlikes=0)
-        reward_text = "👀 Доступ к входящим лайкам на 3 дня активирован!"
-    elif prod_key == "anonymous_view":
-        db.add_vip(user_id, days=7, bonus_superlikes=0)
-        reward_text = "👤 Анонимный просмотр на 7 дней активирован!"
-    else:
-        reward_text = "✅ Услуга успешно активирована!"
-
-    inviter_id = db.reward_inviter_on_purchase(user_id)
-    if inviter_id:
-        try:
-            await bot.send_message(
-                inviter_id,
-                "💎 Приглашённый тобой друг совершил покупку!\n"
-                "🎁 Тебе начислен партнёрский бонус: 👑 +24 часа VIP и +2 💌 Супер-письма!",
-            )
-        except Exception:
-            pass
-
-    return reward_text
-
-
-async def verify_yoomoney_payment(order_id: str, expected_total: int) -> Tuple[bool, str, bool]:
-    if not is_yoomoney_token_configured():
-        return (
-            False,
-            "⏳ Заявка на проверку оплаты отправлена! Если вы уже оплатили счёт, ожидайте подтверждения (обычно 1–3 минуты).",
-            True,
-        )
-
-    url = "https://yoomoney.ru/api/operation-history"
-    headers = {
-        "Authorization": f"Bearer {YOOMONEY_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    data = {"label": order_id, "records": "10"}
+    if not YOOMONEY_TOKEN:
+        return {"success": False, "error": "YOOMONEY_TOKEN не задан"}
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data, timeout=12) as resp:
-                if resp.status == 401:
-                    logging.warning("YOOMONEY_TOKEN невалиден (HTTP 401). Переключение на ручную проверку админом.")
-                    return (
-                        False,
-                        "⏳ Заявка на проверку отправлена! Если вы ещё не оплатили счёт — нажмите кнопку оплаты выше. После оплаты заказ будет активирован.",
-                        True,
-                    )
-                if resp.status != 200:
-                    return (
-                        False,
-                        "⏳ Платёж в обработке. Если вы уже оплатили, подождите 1–2 минуты.",
-                        True,
-                    )
-                result = await resp.json()
+        import aiohttp
+        # Историческая операция по метке (order_id)
+        url = "https://yoomoney.ru/api/operation-history"
+        params = {"label": order_id, "records": 10}
+
+        # Синхронная проверка через requests будет в отдельном потоке,
+        # здесь возвращаем заглушку для асинхронного вызова
+        return {"success": False, "error": "use_async_check"}
     except Exception as e:
-        logging.error(f"YooMoney API error: {e}")
-        return False, "⏳ Ожидание ответа от платёжного шлюза. Попробуйте через минуту.", True
+        return {"success": False, "error": str(e)}
 
-    operations = result.get("operations", [])
-    for op in operations:
-        if op.get("status") == "success" and op.get("direction") == "in":
-            amount = float(op.get("amount", 0))
-            if op.get("label") == order_id and amount >= expected_total * 0.95:
-                return True, "✅ Оплата успешно подтверждена! Привилегии активированы.", False
 
-    return (
-        False,
-        "⏳ Оплата ещё не найдена.\n\n1️⃣ Убедитесь, что вы перешли по кнопке «💳 Оплатить» и завершили перевод.\n2️⃣ После оплаты подождите 10–30 секунд и нажмите «🔄 Проверить оплату» снова.",
-        False,
-    )
+async def async_check_yoomoney_payment(order_id: str) -> dict:
+    """Асинхронная проверка платежа ЮMoney через API."""
+    if not YOOMONEY_TOKEN:
+        return {"success": False, "error": "YOOMONEY_TOKEN не задан"}
+
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://yoomoney.ru/api/operation-history",
+                params={"label": order_id, "records": 10},
+                headers={"Authorization": f"Bearer {YOOMONEY_TOKEN}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    operations = data.get("operations", [])
+                    for op in operations:
+                        if op.get("status") == "success" and op.get("direction") == "in":
+                            return {
+                                "success": True,
+                                "status": "success",
+                                "amount": float(op.get("amount", 0)),
+                                "datetime": op.get("datetime", ""),
+                                "title": op.get("title", ""),
+                            }
+                    return {"success": False, "status": "pending"}
+                return {"success": False, "error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # =========================
@@ -885,12 +821,37 @@ class Database:
                     sender_id INTEGER NOT NULL,
                     receiver_id INTEGER NOT NULL,
                     text TEXT NOT NULL,
+                    media_type TEXT NOT NULL DEFAULT 'text',
+                    media_id TEXT,
                     created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS photo_gallery (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    photo_id TEXT NOT NULL,
+                    media_type TEXT NOT NULL DEFAULT 'photo',
+                    position INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS icebreakers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'general',
+                    is_active INTEGER NOT NULL DEFAULT 1
                 )
                 """
             )
             self._migrate(conn)
             self._create_indexes(conn)
+            self.init_default_icebreakers()
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         p_cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
@@ -1395,12 +1356,110 @@ class Database:
                 (reporter_id, target_id, int(time.time())),
             )
 
-    def log_chat_message(self, sender_id: int, receiver_id: int, text: str) -> None:
+    def log_chat_message(self, sender_id: int, receiver_id: int, text: str, media_type: str = "text", media_id: Optional[str] = None) -> None:
         with self._session() as conn:
             conn.execute(
-                "INSERT INTO chat_messages (sender_id, receiver_id, text, created_at) VALUES (?, ?, ?, ?)",
-                (sender_id, receiver_id, text, int(time.time())),
+                "INSERT INTO chat_messages (sender_id, receiver_id, text, media_type, media_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (sender_id, receiver_id, text, media_type, media_id, int(time.time())),
             )
+
+    def get_chat_history(self, user1: int, user2: int, limit: int = 50) -> List[sqlite3.Row]:
+        with self._session() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM chat_messages
+                WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user1, user2, user2, user1, limit),
+            ).fetchall()
+
+    def get_chat_partners(self, user_id: int) -> List[sqlite3.Row]:
+        """Список пользователей, с которыми есть переписка."""
+        with self._session() as conn:
+            return conn.execute(
+                """
+                SELECT DISTINCT
+                    CASE WHEN sender_id = ? THEN receiver_id ELSE sender_id END AS partner_id,
+                    MAX(created_at) as last_msg
+                FROM chat_messages
+                WHERE sender_id = ? OR receiver_id = ?
+                GROUP BY partner_id
+                ORDER BY last_msg DESC
+                """,
+                (user_id, user_id, user_id),
+            ).fetchall()
+
+    def add_photo_to_gallery(self, user_id: int, photo_id: str, media_type: str = "photo", position: int = 0) -> int:
+        with self._session() as conn:
+            cur = conn.execute(
+                "INSERT INTO photo_gallery (user_id, photo_id, media_type, position, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, photo_id, media_type, position, int(time.time())),
+            )
+            return cur.lastrowid
+
+    def get_photo_gallery(self, user_id: int) -> List[sqlite3.Row]:
+        with self._session() as conn:
+            return conn.execute(
+                "SELECT * FROM photo_gallery WHERE user_id = ? ORDER BY position ASC, created_at ASC",
+                (user_id,),
+            ).fetchall()
+
+    def delete_photo_from_gallery(self, photo_id: int, user_id: int) -> bool:
+        with self._session() as conn:
+            cur = conn.execute(
+                "DELETE FROM photo_gallery WHERE id = ? AND user_id = ?",
+                (photo_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def set_main_photo(self, user_id: int, gallery_id: int) -> None:
+        """Устанавливает фото из галереи как основное в профиле."""
+        with self._session() as conn:
+            row = conn.execute("SELECT photo_id, media_type FROM photo_gallery WHERE id = ? AND user_id = ?", (gallery_id, user_id)).fetchone()
+            if row:
+                conn.execute("UPDATE profiles SET photo_id = ?, media_type = ? WHERE user_id = ?", (row["photo_id"], row["media_type"], user_id))
+
+    def get_icebreakers(self, category: Optional[str] = None, limit: int = 10) -> List[sqlite3.Row]:
+        with self._session() as conn:
+            if category:
+                return conn.execute(
+                    "SELECT * FROM icebreakers WHERE category = ? AND is_active = 1 ORDER BY RANDOM() LIMIT ?",
+                    (category, limit),
+                ).fetchall()
+            return conn.execute(
+                "SELECT * FROM icebreakers WHERE is_active = 1 ORDER BY RANDOM() LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def add_icebreaker(self, text: str, category: str = "general") -> None:
+        with self._session() as conn:
+            conn.execute(
+                "INSERT INTO icebreakers (text, category, is_active) VALUES (?, ?, 1)",
+                (text, category),
+            )
+
+    def init_default_icebreakers(self) -> None:
+        """Добавляет стандартные ледоколы, если таблица пуста."""
+        with self._session() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM icebreakers").fetchone()[0]
+            if count > 0:
+                return
+        default_icebreakers = [
+            ("Привет! Как дела?", "general"),
+            ("Чем обычно занимаешься в свободное время?", "general"),
+            ("Твой любимый фильм или сериал?", "general"),
+            ("Куда бы ты хотел съездить в отпуске?", "путешествия"),
+            ("Ты больше сова или жаворонок?", "general"),
+            ("Какая твоя любимая еда?", "еда"),
+            ("Какая музыка тебя вдохновляет?", "музыка"),
+            ("У тебя есть хобби?", "general"),
+            ("Кто твой кумир или пример для подражания?", "general"),
+            ("Что для тебя идеальный вечер?", "романтика"),
+        ]
+        for text, category in default_icebreakers:
+            self.add_icebreaker(text, category)
 
     def find_candidate(self, user_id: int, city_prioritized: bool = True) -> Optional[sqlite3.Row]:
         me = self.get_profile(user_id)
@@ -1656,6 +1715,7 @@ class ProfileForm(StatesGroup):
     gender = State()
     looking_for = State()
     age = State()
+    country = State()
     city = State()
     interests = State()
     bio = State()
@@ -1697,6 +1757,11 @@ class AdminForm(StatesGroup):
     waiting_broadcast = State()
     waiting_gift_uid = State()
     waiting_search_uid = State()
+
+
+class FilterForm(StatesGroup):
+    waiting_age_min = State()
+    waiting_age_max = State()
 
 
 # =========================
@@ -1776,20 +1841,21 @@ def kb_start_no_profile() -> InlineKeyboardMarkup:
 
 
 def kb_main_menu(db: Database, user_id: int) -> InlineKeyboardMarkup:
+    """Главное меню бота — красивое и компактное."""
     p = db.get_profile(user_id)
     is_adult = bool(p and int(p["age"]) >= 18)
     liked_me_count = len(db.get_who_liked_me(user_id)) if p else 0
 
     rows: List[List[InlineKeyboardButton]] = [
-        # Основные действия
+        # ═══ ПОИСК И ЗНАКОМСТВА ═══
         [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
         [InlineKeyboardButton(text=f"👀 Кто меня лайкнул ({liked_me_count})", callback_data="likes:list")],
-        # Общение и настройки
+        # ═══ ОБЩЕНИЕ ═══
         [
             InlineKeyboardButton(text="💌 Мэтчи и чат", callback_data="matches:list"),
             InlineKeyboardButton(text="⚙️ Анкета", callback_data="settings:open"),
         ],
-        # Бонусы и рефералы
+        # ═══ БОНУСЫ И РЕФЕРАЛЫ ═══
         [
             InlineKeyboardButton(text="🎁 Бонус дня", callback_data="bonus:daily"),
             InlineKeyboardButton(text="👥 Рефералы", callback_data="ref:menu"),
@@ -1873,48 +1939,74 @@ def kb_candidate(target_id: int, show_supermsg: bool = True) -> InlineKeyboardMa
 
 
 def kb_shop_menu() -> InlineKeyboardMarkup:
+    """Красивое меню магазина с категориями и ценниками (только ЮMoney)."""
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Вип подписки
+    # ═══ VIP ПОДПИСКИ ═══
     rows.append([InlineKeyboardButton(text="👑 VIP ПОДПИСКИ", callback_data="shop:info:vip")])
     for key in ("vip_3", "vip_7", "vip_30", "vip_90"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"  {prod.title} — {total} ₽",
+                callback_data=f"shop:buy:{key}",
+            )
+        ])
 
-    # Лайки
+    # ═══ ЛАЙКИ ═══
     rows.append([InlineKeyboardButton(text="❤️ ЛАЙКИ", callback_data="shop:info:likes")])
     for key in ("likes_unlimited", "likes_pack_50"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"  {prod.title} — {total} ₽",
+                callback_data=f"shop:buy:{key}",
+            )
+        ])
 
-    # Бусты
-    rows.append([InlineKeyboardButton(text="🚀 БУСТЫ", callback_data="shop:info:boost")])
+    # ═══ БУСТЫ ═══
+    rows.append([InlineKeyboardButton(text="🚀 БУСТЫ (ТОП)", callback_data="shop:info:boost")])
     for key in ("boost_24", "boost_72"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"  {prod.title} — {total} ₽",
+                callback_data=f"shop:buy:{key}",
+            )
+        ])
 
-    # Супер письма
+    # ═══ СУПЕР-ПИСЬМА ═══
     rows.append([InlineKeyboardButton(text="💌 СУПЕР-ПИСЬМА", callback_data="shop:info:msg")])
     for key in ("super_1", "super_5", "super_15"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"  {prod.title} — {total} ₽",
+                callback_data=f"shop:buy:{key}",
+            )
+        ])
 
-    # Дополнительно
-    rows.append([InlineKeyboardButton(text="🔧 ДРУГОЕ", callback_data="shop:info:extra")])
+    # ═══ ДРУГОЕ ═══
+    rows.append([InlineKeyboardButton(text="🔧 ДОПОЛНИТЕЛЬНО", callback_data="shop:info:extra")])
     for key in ("reset_skips", "see_likes", "anonymous_view"):
         prod = PRODUCTS[key]
         _, _, total = calc_price_with_commission(prod.base_price_rub)
-        rows.append([InlineKeyboardButton(text=f"  {prod.title} — {total} ₽", callback_data=f"shop:buy:{key}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"  {prod.title} — {total} ₽",
+                callback_data=f"shop:buy:{key}",
+            )
+        ])
 
-    rows.append([InlineKeyboardButton(text="🎁 VIP бесплатно (за друзей)", callback_data="ref:menu")])
+    rows.append([InlineKeyboardButton(text="🎁 VIP бесплатно (пригласи друга)", callback_data="ref:menu")])
     rows.append(
         [
             InlineKeyboardButton(text="🛠 Поддержка", url=SUPPORT_URL),
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:home"),
+            InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home"),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1933,6 +2025,12 @@ def kb_settings(active: bool, is_verified: bool, is_adult: bool) -> InlineKeyboa
         ],
         [
             InlineKeyboardButton(text="🚻 Пол / Кого ищу", callback_data="edit:prefs"),
+        ],
+        [
+            InlineKeyboardButton(text="📸 Моя галерея фото", callback_data="gallery:my:menu"),
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Фильтры поиска", callback_data="filters:menu"),
         ],
     ]
     if is_adult:
@@ -1974,7 +2072,12 @@ def card_section(title: str) -> str:
 
 def screen_footer(text: str) -> str:
     """Нижняя часть экрана с разделителем."""
-    return f"\n━━━━━━━━━━━━━━━━━━━━\n<i>{esc(text)}</i>"
+    return f"\n{divider_line()}\n<i>{esc(text)}</i>"
+
+
+def screen_section(title: str, content: str) -> str:
+    """Секция внутри экрана с заголовком и содержимым."""
+    return f"\n📂 <b>{title}</b>\n{content}"
 
 
 def format_profile_card(
@@ -2036,16 +2139,18 @@ router = Router()
 async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[str] = None) -> None:
     p = db.get_profile(user_id)
     if not p:
+        welcome_lines = [
+            stat_row("🎯", "Подбор", "По полу, возрасту, городу и интересам"),
+            stat_row("💞", "Мэтч", "Взаимная симпатия — только если понравились друг другу"),
+            stat_row("💬", "Чат", "Встроенная переписка и ледоколы"),
+            stat_row("👤", "Верификация", "Защита от фейков и ботов"),
+            stat_row("👑", "VIP", "Статус, бусты и супер-письма"),
+        ]
+        welcome_box = screen_box("💎 Что внутри «Лавчик»", welcome_lines)
         text = (
-            f"{screen_header('Лавчик 💘', 'Знакомства, которые работают')}\n\n"
-            f"<b>Что это за бот:</b>\n"
-            f"«Лавчик» — сервис знакомств нового поколения для поиска друзей, общения и серьезных отношений.\n\n"
-            f"<b>Зачем он нужен:</b>\n"
-            f"• 🎯 Умный подбор по полу, возрасту, городу и интересам\n"
-            f"• 💞 Взаимная симпатия — мэтч только если понравились друг другу\n"
-            f"• 💬 Встроенный чат и ледоколы для легкого старта общения\n"
-            f"• 👤 Верификация анкет против фейков и ботов\n"
-            f"• 👑 VIP-статус, бусты и супер-письма для комфортного поиска\n\n"
+            f"{screen_header('Лавчик 💘', 'Знакомства нового поколения')}\n\n"
+            f"<b>«Лавчик»</b> — сервис знакомств для поиска друзей, общения и серьезных отношений.\n\n"
+            f"{welcome_box}\n\n"
             f"🌍 Доступно: Россия, Беларусь, Казахстан, Украина и другие страны\n\n"
             f"👇 <b>Создай анкету за 30 секунд и начни знакомства:</b>"
         )
@@ -2085,16 +2190,24 @@ async def render_home(bot: Bot, db: Database, user_id: int, username: Optional[s
         remaining = max(0, FREE_DAILY_LIKES - used)
         likes_line = f"{remaining}/{FREE_DAILY_LIKES} сегодня"
 
+    # Красивый блок профиля
+    profile_lines = [
+        stat_row("📡", "Статус", active_status),
+        stat_row("👑", "VIP", vip_status),
+        stat_row("❤️", "Лайки", likes_line),
+        stat_row("💌", "Супер-писем", str(p["superlikes"])),
+        stat_row("👥", "Рефералов", str(p["ref_count"])),
+    ]
+    if boost_status:
+        profile_lines.append(stat_row("🚀", "Буст", boost_status))
+
+    profile_box = screen_box("📊 Моя статистика", profile_lines)
+
     text = (
         f"{format_profile_card(p, title='Моя анкета', show_prefs=True)}\n"
-        f"\n{stat_row('📡', 'Статус', active_status)}\n"
-        f"{stat_row('👑', 'VIP', vip_status)}\n"
-        f"{stat_row('❤️', 'Лайки', likes_line)}\n"
-        f"{stat_row('💌', 'Супер-писем', str(p['superlikes']))}\n"
-        f"{stat_row('👥', 'Рефералов', str(p['ref_count']))}\n"
+        f"{profile_box}\n"
+        f"{screen_footer('Нажми «🔥 Смотреть анкеты», чтобы начать знакомства!')}"
     )
-    if boost_status:
-        text += f"{stat_row('🚀', 'Буст', boost_status)}\n"
     await send_chat_action(bot, user_id, "typing")
     await send_sticker(bot, user_id, "welcome")
     await send_screen(
@@ -2128,6 +2241,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
 async def cb_menu_home(call: CallbackQuery, state: FSMContext, db: Database, bot: Bot) -> None:
     await state.clear()
     await call.answer()
+    await send_transition_sticker(bot, call.from_user.id, "home")
     await render_home(bot, db, call.from_user.id, username=call.from_user.username)
 
 
@@ -2588,7 +2702,7 @@ async def ask_step_age(bot: Bot, user_id: int, state: FSMContext) -> None:
 
 
 async def ask_step_country(bot: Bot, user_id: int, state: FSMContext) -> None:
-    await state.set_state(ProfileForm.city)  # переиспользуем состояние для страны, но пометим в data
+    await state.set_state(ProfileForm.country)
     await state.update_data(choosing_country=True)
     quick_countries = [
         [
@@ -2771,10 +2885,10 @@ async def form_age(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
     await state.update_data(age=int(raw))
-    await ask_step_city(bot, message.from_user.id, state)
+    await ask_step_country(bot, message.from_user.id, state)
 
 
-@router.callback_query(F.data.startswith("form:country:"))
+@router.callback_query(ProfileForm.country, F.data.startswith("form:country:"))
 async def form_country_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
     country = call.data.split(":", 2)[2]
@@ -2791,6 +2905,30 @@ async def form_country_cb(call: CallbackQuery, state: FSMContext, bot: Bot) -> N
         return
     await state.update_data(choosing_country=False, country=country)
     await ask_step_city(bot, call.from_user.id, state)
+
+
+@router.message(ProfileForm.country, F.text.startswith("/"))
+async def form_country_ignore_commands(message: Message, state: FSMContext, bot: Bot) -> None:
+    pass
+
+
+@router.message(ProfileForm.country)
+async def form_country_manual(message: Message, state: FSMContext, bot: Bot) -> None:
+    await delete_user_msg(message)
+    data = await state.get_data()
+    if not data.get("choosing_country"):
+        return
+    raw_country = (message.text or "").strip()
+    if len(raw_country) < 2 or len(raw_country) > 40:
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Название страны должно быть от 2 до 40 символов.</b>",
+            reply_markup=kb_form_nav(back_step="age"),
+        )
+        return
+    await state.update_data(choosing_country=False, country=normalize_country(raw_country))
+    await ask_step_city(bot, message.from_user.id, state)
 
 
 @router.message(ProfileForm.city, F.text.startswith("/"))
@@ -3339,6 +3477,7 @@ async def show_next_candidate(bot: Bot, db: Database, user_id: int) -> None:
 @router.callback_query(F.data == "browse:next")
 async def cb_browse_next(call: CallbackQuery, db: Database, bot: Bot) -> None:
     await call.answer()
+    await send_transition_sticker(bot, call.from_user.id, "browse")
     await show_next_candidate(bot, db, call.from_user.id)
 
 
@@ -3380,6 +3519,7 @@ async def cb_react(call: CallbackQuery, db: Database, bot: Bot) -> None:
         return
 
     if action == "like":
+        await send_transition_sticker(bot, user_id, "like")
         if not db.is_vip(user_id) and db.count_today_likes(user_id) >= FREE_DAILY_LIKES:
             await call.answer("Дневной лимит бесплатных лайков исчерпан!", show_alert=True)
             kb = InlineKeyboardMarkup(
@@ -3564,6 +3704,7 @@ async def cb_chat_write(call: CallbackQuery, state: FSMContext, db: Database, bo
     if not target or int(target["active"]) == 0 or int(target["banned"] or 0) == 1:
         await call.answer("Пользователь больше не активен.", show_alert=True)
         return
+    await send_transition_sticker(bot, uid, "message")
 
     if db.is_blocked_between(uid, target_id):
         await call.answer("Переписка с этим пользователем недоступна (ЧС).", show_alert=True)
@@ -3866,7 +4007,6 @@ async def msg_super_send(message: Message, state: FSMContext, db: Database, bot:
 # МЭТЧИ, МОДЕРАЦИЯ ЖАЛОБ И НАСТРОЙКИ
 # =========================
 @router.callback_query(F.data == "matches:list")
-@router.callback_query(F.data == "matches:list")
 async def cb_matches_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
     await call.answer()
     await send_sticker(bot, call.from_user.id, "match")
@@ -3906,6 +4046,60 @@ async def cb_matches_list(call: CallbackQuery, db: Database, bot: Bot) -> None:
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="menu:home")])
 
     await send_screen(bot, uid, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("chat:history:"))
+async def cb_chat_history(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    partner_id = int(call.data.split(":")[2])
+    partner = db.get_profile(partner_id)
+    if not partner:
+        await call.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    messages = db.get_chat_history(uid, partner_id, limit=30)
+    messages = list(reversed(messages))
+
+    partner_age = partner["age"]
+    lines = [
+        f"{screen_header('Чат', esc(partner['name']) + f', {partner_age}')}\n",
+        f"<i>Переписка с {esc(partner['name'])} ({esc(partner['city'])})</i>\n",
+        random_divider(),
+    ]
+
+    if not messages:
+        lines.append("<i>Пока нет сообщений. Начните общение!</i>")
+    else:
+        for msg in messages[-20:]:
+            is_me = int(msg["sender_id"]) == uid
+            prefix = "🟢 Ты:" if is_me else f"💌 {esc(partner['name'])}:"
+            text_content = esc(msg["text"] or "")
+            if msg["media_type"] == "photo":
+                text_content = "[📷 Фото]"
+            elif msg["media_type"] == "video":
+                text_content = "[🎥 Видео]"
+            lines.append(f"\n{prefix} {text_content}")
+
+    kb_rows = [
+        [
+            InlineKeyboardButton(text="✍️ Написать сообщение", callback_data=f"chat:write:{partner_id}"),
+            InlineKeyboardButton(text="🎲 Отправить Ледокол", callback_data=f"chat:ice:{partner_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="📸 Галерея фото", callback_data=f"gallery:view:{partner_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="💌 К списку мэтчей", callback_data="matches:list"),
+            InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home"),
+        ],
+    ]
+
+    await send_screen(
+        bot,
+        uid,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
 
 
 @router.callback_query(F.data.startswith("safety:"))
@@ -3985,6 +4179,7 @@ async def cb_settings_open(call: CallbackQuery, state: FSMContext, db: Database,
         await render_home(bot, db, uid)
         return
     await call.answer()
+    await send_transition_sticker(bot, uid, "settings")
     active = int(p["active"]) == 1
     is_verified = int(p["verified"] or 0) == 1
     is_adult = int(p["age"]) >= 18
@@ -4044,12 +4239,173 @@ async def cb_settings_toggle(call: CallbackQuery, db: Database, bot: Bot) -> Non
 
 
 # =========================
+# ФИЛЬТРЫ ПОИСКА
+# =========================
+@router.callback_query(F.data == "filters:menu")
+async def cb_filters_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
+    uid = call.from_user.id
+    p = db.get_profile(uid)
+    if not p:
+        await call.answer("Сначала создай анкету!", show_alert=True)
+        return
+
+    await call.answer()
+    min_age = int(p["min_pref_age"] or 18)
+    max_age = int(p["max_pref_age"] or 45)
+    looking = str(p["looking_for"] or "A")
+    looking_label = format_looking_for_label(looking)
+    city_name = esc(p["city"])
+
+    text = (
+        f"{screen_header('Фильтры поиска', 'Кого показывать в анкетах')}\n\n"
+        f"📋 <b>Текущие фильтры:</b>\n"
+        f"{stat_row('🎂', 'Возраст', f'{min_age}–{max_age} лет')}\n"
+        f"{stat_row('🚻', 'Кого ищешь', looking_label)}\n"
+        f"{stat_row('📍', 'Город', f'Твой город ({city_name})')}\n\n"
+        f"<i>Измени фильтры, чтобы видеть более подходящие анкеты.</i>"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🔻 Мин. возраст: {min_age}", callback_data="filter:agemin"),
+                InlineKeyboardButton(text=f"🔺 Макс. возраст: {max_age}", callback_data="filter:agemax"),
+            ],
+            [
+                InlineKeyboardButton(text="🚻 Кого ищешь", callback_data="edit:prefs"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data="settings:open"),
+            ],
+        ]
+    )
+    await send_screen(bot, uid, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "filter:agemin")
+async def cb_filter_agemin(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    await state.set_state(FilterForm.waiting_age_min)
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "🔻 <b>Минимальный возраст поиска</b>\n\n"
+        "Введи число от 14 до 80:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+        ),
+    )
+
+
+@router.callback_query(F.data == "filter:agemax")
+async def cb_filter_agemax(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await call.answer()
+    await state.set_state(FilterForm.waiting_age_max)
+    await send_screen(
+        bot,
+        call.from_user.id,
+        "🔺 <b>Максимальный возраст поиска</b>\n\n"
+        "Введи число от 14 до 80:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+        ),
+    )
+
+
+@router.message(FilterForm.waiting_age_min)
+async def form_filter_age_min(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not (14 <= int(raw) <= 80):
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Введи корректный возраст числом от 14 до 80:</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+            ),
+        )
+        return
+
+    uid = message.from_user.id
+    p = db.get_profile(uid)
+    max_age = int(p["max_pref_age"] or 45)
+    if int(raw) > max_age:
+        await send_screen(
+            bot,
+            uid,
+            f"⚠️ Минимальный возраст не может быть больше максимального ({max_age}).",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+            ),
+        )
+        return
+
+    with db._session() as conn:
+        conn.execute("UPDATE profiles SET min_pref_age = ? WHERE user_id = ?", (int(raw), uid))
+
+    await state.clear()
+    await send_screen(
+        bot,
+        uid,
+        f"✅ Минимальный возраст поиска установлен: {raw} лет",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ К фильтрам", callback_data="filters:menu")]]
+        ),
+    )
+
+
+@router.message(FilterForm.waiting_age_max)
+async def form_filter_age_max(message: Message, state: FSMContext, db: Database, bot: Bot) -> None:
+    await delete_user_msg(message)
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not (14 <= int(raw) <= 80):
+        await send_screen(
+            bot,
+            message.from_user.id,
+            "⚠️ <b>Введи корректный возраст числом от 14 до 80:</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+            ),
+        )
+        return
+
+    uid = message.from_user.id
+    p = db.get_profile(uid)
+    min_age = int(p["min_pref_age"] or 18)
+    if int(raw) < min_age:
+        await send_screen(
+            bot,
+            uid,
+            f"⚠️ Максимальный возраст не может быть меньше минимального ({min_age}).",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="filters:menu")]]
+            ),
+        )
+        return
+
+    with db._session() as conn:
+        conn.execute("UPDATE profiles SET max_pref_age = ? WHERE user_id = ?", (int(raw), uid))
+
+    await state.clear()
+    await send_screen(
+        bot,
+        uid,
+        f"✅ Максимальный возраст поиска установлен: {raw} лет",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ К фильтрам", callback_data="filters:menu")]]
+        ),
+    )
+
+
+# =========================
 # МАГАЗИН И ОПЛАТА ЮMONEY
 # =========================
 async def complete_and_reward_order(bot: Bot, db: Database, order: sqlite3.Row, charge_source: str) -> str:
     uid = int(order["user_id"])
     prod_key = str(order["product"])
     db.mark_order_paid(str(order["order_id"]), charge_source)
+    await send_transition_sticker(bot, uid, "success")
 
     if prod_key == "vip_3":
         db.add_vip(uid, days=3, bonus_superlikes=2)
@@ -4133,11 +4489,19 @@ async def cb_shop_menu(call: CallbackQuery, db: Database, bot: Bot) -> None:
         return
 
     await call.answer()
+    await send_transition_sticker(bot, uid, "shop")
+    
+    now = int(time.time())
+    vip_active = int(me["vip_until"]) > now
+    vip_line = f"👑 <b>Ваш VIP:</b> активен до {(int(me['vip_until']) - now) // 86400} дн." if vip_active else "👑 <b>Ваш VIP:</b> не подключён"
+
     payment_box = screen_box("💳 Способ оплаты", [
         stat_row("🏦", "ЮMoney", "Банковские карты РФ (Mir, Visa, Mastercard)"),
+        stat_row("⭐️", "Звёзды Telegram", "Оплата внутри Telegram (если подключено)"),
     ])
     text = (
-        f"{screen_header('Магазин привилегий', 'VIP и услуги для анкеты')}\n"
+        f"{screen_header('👑 Магазин привилегий', 'VIP и услуги для анкеты')}\n"
+        f"{vip_line}\n\n"
         "Выдели свою анкету среди тысяч других, открой список всех, кто тебя лайкнул, и пиши любому человеку напрямую без ожидания взаимности!\n\n"
         f"{payment_box}\n\n"
         "👇 <b>Выбери нужную привилегию:</b>"
@@ -4155,6 +4519,7 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
 
     prod_key = call.data.split(":", 2)[2]
     prod = PRODUCTS.get(prod_key)
+    await send_transition_sticker(bot, uid, "coins")
     if not prod:
         await call.answer("Товар не найден", show_alert=True)
         return
@@ -4200,13 +4565,6 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
         [InlineKeyboardButton(text=f"💳 Оплатить {total_rub} ₽ через ЮMoney", url=pay_url)],
     ]
 
-    # Оплата звёздами (Telegram Stars)
-    if is_stars_configured():
-        stars_amount = rub_to_stars(total_rub)
-        kb_rows.append([
-            InlineKeyboardButton(text=f"⭐️ Оплатить {stars_amount} ⭐️ (Звёзды)", callback_data=f"shop:pay:stars:{order_id}")
-        ])
-
     kb_rows.extend([
         [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"shop:check:{order_id}")],
         [InlineKeyboardButton(text="🛠 Помощь / Написать в поддержку", url=SUPPORT_URL)],
@@ -4220,48 +4578,6 @@ async def cb_shop_buy(call: CallbackQuery, db: Database, bot: Bot) -> None:
     await send_screen(bot, uid, text, reply_markup=kb)
 
 
-@router.callback_query(F.data.startswith("shop:pay:stars:"))
-async def cb_shop_pay_stars(call: CallbackQuery, db: Database, bot: Bot) -> None:
-    """Оплата заказа через Telegram Stars."""
-    uid = call.from_user.id
-    if not is_stars_configured():
-        await call.answer("Оплата звёздами пока недоступна.", show_alert=True)
-        return
-
-    order_id = call.data.split(":", 3)[3]
-    order = db.get_order(order_id)
-    if not order or int(order["user_id"]) != uid:
-        await call.answer("Заказ не найден.", show_alert=True)
-        return
-
-    if order["status"] == "paid":
-        await call.answer("Заказ уже оплачен!", show_alert=True)
-        return
-
-    prod_key = str(order["product"])
-    prod = PRODUCTS.get(prod_key)
-    if not prod:
-        await call.answer("Товар не найден.", show_alert=True)
-        return
-
-    total_rub = int(order["amount"])
-    payload, stars_amount, prices = await create_stars_invoice(order_id, total_rub, prod.title, prod.description)
-
-    try:
-        await bot.send_invoice(
-            chat_id=uid,
-            title=prod.title,
-            description=prod.description[:256],
-            payload=payload,
-            currency="XTR",
-            prices=prices,
-        )
-        await call.answer("Счёт выставлен! Оплатой через звёзды.")
-    except Exception as e:
-        logging.error(f"Stars invoice error: {e}")
-        await call.answer("Ошибка выставления счёта.", show_alert=True)
-
-
 @router.callback_query(F.data.startswith("shop:check:"))
 async def cb_shop_check(call: CallbackQuery, db: Database, bot: Bot) -> None:
     uid = call.from_user.id
@@ -4273,72 +4589,37 @@ async def cb_shop_check(call: CallbackQuery, db: Database, bot: Bot) -> None:
         return
 
     if order["status"] == "paid":
-        await call.answer("Этот заказ уже оплачен и активирован!", show_alert=True)
+        await call.answer("Заказ уже оплачен и активирован! ✅", show_alert=True)
         await render_home(bot, db, uid)
         return
 
-    paid, msg, need_admin_manual = await verify_yoomoney_payment(order_id, int(order["amount"]))
-    if not paid:
-        if need_admin_manual and ADMIN_ID > 0:
-            now = int(time.time())
-            last_sent = admin_notified_orders.get(order_id, 0)
-            if now - last_sent >= 60:
-                admin_notified_orders[order_id] = now
-                prod = PRODUCTS.get(str(order["product"]))
-                prod_title = prod.title if prod else str(order["product"])
-                buyer = db.get_profile(uid)
-                buyer_info = f"{esc(buyer['name'])} (@{esc(buyer['username'] or 'нет')})" if buyer else f"ID {uid}"
-
-                adm_kb = InlineKeyboardMarkup(
+    # Автопроверка оплаты через ЮMoney API
+    result = await async_check_yoomoney_payment(order_id)
+    if result.get("success"):
+        reward_text = await complete_and_reward_order(bot, db, order, f"yoomoney_auto_{order_id}")
+        await call.answer("Оплата подтверждена! Привилегии начислены ✅", show_alert=True)
+        try:
+            await call.message.edit_text(
+                f"{esc(call.message.text)}\n\n✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА АВТОМАТИЧЕСКИ — ПРИВИЛЕГИИ ВЫДАНЫ</b>"
+            )
+        except Exception:
+            pass
+        try:
+            await send_screen(
+                bot,
+                uid,
+                f"🎉 <b>Оплата подтверждена!</b>\n━━━━━━━━━━━━━━━━━━━━\n{reward_text}",
+                reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text=f"✅ Подтвердить ({order['amount']} ₽) и выдать",
-                                callback_data=f"adminpay:approve:{order_id}",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="❌ Оплата не поступила",
-                                callback_data=f"adminpay:reject:{order_id}",
-                            )
-                        ],
+                        [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
+                        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
                     ]
-                )
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"💳 <b>Запрос проверки оплаты ЮMoney</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"👤 Покупатель: <b>{buyer_info}</b> (<code>{uid}</code>)\n"
-                        f"📦 Услуга: <b>{esc(prod_title)}</b>\n"
-                        f"💰 Сумма: <b>{order['amount']} ₽</b>\n"
-                        f"🏷 Метка платежа: <code>{order_id}</code>\n\n"
-                        f"<i>Проверьте поступление в кошельке ЮMoney ({YOOMONEY_WALLET}) и нажмите кнопку ниже:</i>",
-                        reply_markup=adm_kb,
-                    )
-                except Exception:
-                    pass
-
-        await call.answer(msg, show_alert=True)
-        return
-
-    reward_text = await complete_and_reward_order(bot, db, order, f"yoomoney_{order_id}")
-    await call.answer("Оплата прошла успешно! 🎉", show_alert=True)
-    await send_sticker(bot, uid, "vip")
-    await send_screen(
-        bot,
-        uid,
-        f"{celebration_line('Оплата прошла успешно!')}\n"
-        f"🎁 <b>Спасибо за покупку!</b>\n"
-        f"{random_divider()}\n{reward_text}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
-                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
-            ]
-        ),
-    )
+                ),
+            )
+        except Exception:
+            pass
+    else:
+        await call.answer("Оплата пока не найдена. Повторите перевод или проверьте позже.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("adminpay:"))
@@ -4406,55 +4687,8 @@ async def cb_admin_payment_decision(call: CallbackQuery, db: Database, bot: Bot)
 
 
 # =========================
-# ТЕLEGRAM STARS (ОПЛАТА ЗВЁЗДАМИ)
+# Оплата только через ЮMoney (автопроверка через API)
 # =========================
-@router.pre_checkout_query()
-async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery, bot: Bot, db: Database) -> None:
-    """Подтверждение готовности принять оплату звёздами."""
-    payload = pre_checkout_query.invoice_payload
-    if not payload or not payload.startswith("stars_"):
-        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Неверный заказ.")
-        return
-
-    order_id = payload.replace("stars_", "", 1)
-    order = db.get_order(order_id)
-    if not order or order["status"] == "paid":
-        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Заказ не найден или уже оплачен.")
-        return
-
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-
-@router.message(F.successful_payment)
-async def process_successful_payment(message: Message, db: Database, bot: Bot) -> None:
-    """Начисление привилегий после успешной оплаты звёздами."""
-    payment = message.successful_payment
-    payload = payment.invoice_payload
-
-    if not payload or not payload.startswith("stars_"):
-        return
-
-    order_id = payload.replace("stars_", "", 1)
-    order = db.get_order(order_id)
-    if not order or order["status"] == "paid":
-        return
-
-    uid = int(order["user_id"])
-    prod_key = str(order["product"])
-
-    reward_text = await process_stars_payment(bot, db, uid, order_id, prod_key, payment.telegram_payment_charge_id)
-
-    await message.answer(
-        f"🎉 <b>Оплата звёздами прошла успешно!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{reward_text}",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔥 Смотреть анкеты", callback_data="browse:next")],
-                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home")],
-            ]
-        ),
-    )
 
 
 # =========================
